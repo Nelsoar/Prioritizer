@@ -59,7 +59,20 @@ Share the deployed URL (later) or `http://localhost:5174` on VPN. Each person si
 
 ---
 
-## Next steps
+## Deploy on Vercel
+
+1. **Import** [github.com/Nelsoar/Prioritizer](https://github.com/Nelsoar/Prioritizer) (already linked)
+2. **Settings → Environment Variables** — add both for Production, Preview, and Development:
+   - `VITE_SUPABASE_URL` = `https://corezdvuzmsxnjshrsgt.supabase.co`
+   - `VITE_SUPABASE_PUBLISHABLE_KEY` = your `sb_publishable_...` key from Supabase
+3. **Deploy** (or Redeploy after adding env vars)
+4. **Supabase → Authentication → URL configuration**
+   - **Site URL** → your Vercel URL (e.g. `https://prioritizer-xxx.vercel.app`)
+   - **Redirect URLs** → add the same URL + `http://localhost:5174`
+
+Share the Vercel URL with colleagues. They sign up and use the app in the browser.
+
+---
 
 1. Wire autosave to Supabase `app_states` (replace localStorage for logged-in users)
 2. Deploy frontend to Vercel/Netlify/S3 + custom domain
