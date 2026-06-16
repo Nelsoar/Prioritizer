@@ -22,6 +22,8 @@ import {
   Home,
   Archive,
   LogOut,
+  Printer,
+  HelpCircle,
 } from "lucide-react";
 import { useAuth, useProfilePicker } from "./auth/AuthProvider";
 
@@ -76,12 +78,25 @@ type Task = {
 };
 type Weights = { impact: number; confidence: number; ease: number; urgency: number };
 
+type TodayPickMode = "tasks" | "subtasks";
+type TodaySlotRef =
+  | { kind: "task"; taskId: string }
+  | { kind: "subtask"; taskId: string; subtaskId: string };
+type TodaySlot = { ref: TodaySlotRef | null; done: boolean };
+
 type TodayPlan = {
   date: string;
   mainTaskId: string | null;
+  mainDone: boolean;
   mainHoursLogged: number;
-  workSlotIds: (string | null)[];
-  lifeSlotIds: (string | null)[];
+  workMode: TodayPickMode;
+  lifeMode: TodayPickMode;
+  workSlots: TodaySlot[];
+  lifeSlots: TodaySlot[];
+  /** @deprecated migrated to workSlots */
+  workSlotIds?: (string | null)[];
+  /** @deprecated migrated to lifeSlots */
+  lifeSlotIds?: (string | null)[];
 };
 
 type SortBy = "manual" | "ice" | "urgency" | "iu";
@@ -150,7 +165,7 @@ function buildAppState(persisted: Partial<AppState> | null): AppState {
     focus: !!persisted?.focus,
     showCompleted: persisted?.showCompleted ?? true,
     showArchived: persisted?.showArchived ?? false,
-    section: (persisted?.section as Section) || "today",
+    section: (persisted?.section as Section) || "work",
     today: normalizeTodayPlan(persisted?.today),
     wip: (persisted?.wip as any) || { now: 0, next: 0, later: 0 },
     thresholds: persisted?.thresholds || { imp: 0, urg: 0 },
@@ -165,27 +180,49 @@ const todayDateKey = () => {
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 };
+const emptyTodaySlots = (): TodaySlot[] => [
+  { ref: null, done: false },
+  { ref: null, done: false },
+  { ref: null, done: false },
+];
 const emptyTodayPlan = (): TodayPlan => ({
   date: todayDateKey(),
   mainTaskId: null,
+  mainDone: false,
   mainHoursLogged: 0,
-  workSlotIds: [null, null, null],
-  lifeSlotIds: [null, null, null],
+  workMode: "tasks",
+  lifeMode: "tasks",
+  workSlots: emptyTodaySlots(),
+  lifeSlots: emptyTodaySlots(),
 });
+const normalizeSlots = (
+  slots: TodaySlot[] | undefined,
+  legacyIds: (string | null)[] | undefined
+): TodaySlot[] => {
+  if (Array.isArray(slots) && slots.length) {
+    const base = slots.slice(0, 3).map((s) => ({
+      ref: s?.ref ?? null,
+      done: !!s?.done,
+    }));
+    while (base.length < 3) base.push({ ref: null, done: false });
+    return base;
+  }
+  const ids = Array.isArray(legacyIds) ? legacyIds.slice(0, 3) : [];
+  while (ids.length < 3) ids.push(null);
+  return ids.map((id) => ({ ref: id ? { kind: "task" as const, taskId: id } : null, done: false }));
+};
 const normalizeTodayPlan = (plan: Partial<TodayPlan> | undefined): TodayPlan => {
   const today = todayDateKey();
   if (!plan || plan.date !== today) return emptyTodayPlan();
-  const slots = (arr: (string | null)[] | undefined) => {
-    const base = Array.isArray(arr) ? arr.slice(0, 3) : [];
-    while (base.length < 3) base.push(null);
-    return base;
-  };
   return {
     date: today,
     mainTaskId: plan.mainTaskId ?? null,
+    mainDone: !!plan.mainDone,
     mainHoursLogged: numOr(plan.mainHoursLogged, 0),
-    workSlotIds: slots(plan.workSlotIds),
-    lifeSlotIds: slots(plan.lifeSlotIds),
+    workMode: plan.workMode === "subtasks" ? "subtasks" : "tasks",
+    lifeMode: plan.lifeMode === "subtasks" ? "subtasks" : "tasks",
+    workSlots: normalizeSlots(plan.workSlots, plan.workSlotIds),
+    lifeSlots: normalizeSlots(plan.lifeSlots, plan.lifeSlotIds),
   };
 };
 const normalizeTask = (t: Task): Task => ({
@@ -193,13 +230,48 @@ const normalizeTask = (t: Task): Task => ({
   board: t.board === "life" ? "life" : "work",
   archived: !!t.archived,
 });
-const clearTaskFromTodayPlan = (plan: TodayPlan, taskId: string): TodayPlan => ({
-  ...plan,
-  mainTaskId: plan.mainTaskId === taskId ? null : plan.mainTaskId,
-  mainHoursLogged: plan.mainTaskId === taskId ? 0 : plan.mainHoursLogged,
-  workSlotIds: plan.workSlotIds.map((id) => (id === taskId ? null : id)),
-  lifeSlotIds: plan.lifeSlotIds.map((id) => (id === taskId ? null : id)),
-});
+const slotRefKey = (ref: TodaySlotRef | null): string | null => {
+  if (!ref) return null;
+  if (ref.kind === "task") return `task:${ref.taskId}`;
+  return `subtask:${ref.taskId}:${ref.subtaskId}`;
+};
+const parseSlotOption = (val: string): TodaySlotRef | null => {
+  if (!val) return null;
+  if (val.startsWith("task:")) return { kind: "task", taskId: val.slice(5) };
+  const parts = val.startsWith("subtask:") ? val.slice(8).split(":") : [];
+  if (parts.length === 2) return { kind: "subtask", taskId: parts[0], subtaskId: parts[1] };
+  return null;
+};
+const markTodayDoneForTask = (plan: TodayPlan, taskId: string): TodayPlan => {
+  const mark = (slot: TodaySlot): TodaySlot => {
+    if (!slot.ref) return slot;
+    if (slot.ref.kind === "task" && slot.ref.taskId === taskId) return { ...slot, done: true };
+    if (slot.ref.kind === "subtask" && slot.ref.taskId === taskId) return { ...slot, done: true };
+    return slot;
+  };
+  return {
+    ...plan,
+    mainDone: plan.mainTaskId === taskId ? true : plan.mainDone,
+    workSlots: plan.workSlots.map(mark),
+    lifeSlots: plan.lifeSlots.map(mark),
+  };
+};
+const clearTodayRefsForTask = (plan: TodayPlan, taskId: string): TodayPlan => {
+  const clear = (slot: TodaySlot): TodaySlot => {
+    if (!slot.ref) return slot;
+    if (slot.ref.kind === "task" && slot.ref.taskId === taskId) return { ref: null, done: false };
+    if (slot.ref.taskId === taskId) return { ref: null, done: false };
+    return slot;
+  };
+  return {
+    ...plan,
+    mainTaskId: plan.mainTaskId === taskId ? null : plan.mainTaskId,
+    mainDone: plan.mainTaskId === taskId ? false : plan.mainDone,
+    mainHoursLogged: plan.mainTaskId === taskId ? 0 : plan.mainHoursLogged,
+    workSlots: plan.workSlots.map(clear),
+    lifeSlots: plan.lifeSlots.map(clear),
+  };
+};
 type DueBadge = { label: string; tone: "danger" | "warn" | "accent" };
 function dueBadge(due: number | null | undefined): DueBadge | null {
   if (due == null) return null;
@@ -790,7 +862,7 @@ export default function App() {
   const updateTask = (id: string, patch: Partial<Task>) =>
     setStatePreserveScroll((s) => ({
       ...s,
-      today: patch.completed === true ? clearTaskFromTodayPlan(s.today, id) : s.today,
+      today: patch.completed === true ? markTodayDoneForTask(s.today, id) : s.today,
       tasks: s.tasks.map((t) => (t.id === id ? { ...t, ...patch, updatedAt: Date.now() } : t)),
     }));
 
@@ -829,7 +901,7 @@ export default function App() {
   const archiveTask = (id: string) =>
     setStatePreserveScroll((s) => ({
       ...s,
-      today: clearTaskFromTodayPlan(s.today, id),
+      today: clearTodayRefsForTask(s.today, id),
       tasks: s.tasks.map((t) =>
         t.id === id ? { ...t, archived: true, archivedAt: Date.now(), updatedAt: Date.now() } : t
       ),
@@ -846,7 +918,7 @@ export default function App() {
   const deleteTask = (id: string) =>
     setStatePreserveScroll((s) => ({
       ...s,
-      today: clearTaskFromTodayPlan(s.today, id),
+      today: clearTodayRefsForTask(s.today, id),
       tasks: s.tasks
         .filter((t) => t.id !== id)
         .map((t) =>
@@ -1282,139 +1354,356 @@ export default function App() {
       (t) => (t.board || "work") === board && !t.archived && !effectivelyCompleted(t)
     );
 
+  const pickerSubtasks = (board: BoardKind) => {
+    const rows: { key: string; ref: TodaySlotRef; label: string }[] = [];
+    for (const t of state.tasks) {
+      if ((t.board || "work") !== board || t.archived) continue;
+      for (const c of t.children || []) {
+        if (c.completed) continue;
+        rows.push({
+          key: `subtask:${t.id}:${c.id}`,
+          ref: { kind: "subtask", taskId: t.id, subtaskId: c.id },
+          label: `${t.title} › ${c.title}`,
+        });
+      }
+    }
+    return rows;
+  };
+
+  const slotLabel = (ref: TodaySlotRef | null): string => {
+    if (!ref) return "";
+    if (ref.kind === "task") return taskById.get(ref.taskId)?.title || "Task";
+    const parent = taskById.get(ref.taskId);
+    const sub = parent?.children?.find((c) => c.id === ref.subtaskId);
+    return sub ? `${parent?.title || "Task"} › ${sub.title}` : "Subtask";
+  };
+
+  const todayPrintRef = useRef<HTMLDivElement>(null);
+
+  function IceHelpPanel() {
+    return (
+      <div className="ice-help">
+        <div className="row gap">
+          <HelpCircle size={16} />
+          <strong>ICE scoring (quick guide)</strong>
+        </div>
+        <p className="muted tiny ice-help-lead">
+          Rate each task 1–10. Higher scores rise on the board when sorted by ICE or ICE × Urgency.
+        </p>
+        <dl className="ice-defs">
+          <div>
+            <dt>I — Impact</dt>
+            <dd>How much value if this succeeds? (revenue, learning, unblock others)</dd>
+          </div>
+          <div>
+            <dt>C — Confidence</dt>
+            <dd>How sure are you it will work / pay off?</dd>
+          </div>
+          <div>
+            <dt>E — Ease</dt>
+            <dd>How fast / cheap to finish? (inverse of effort)</dd>
+          </div>
+          <div>
+            <dt>U — Urgency</dt>
+            <dd>How time-sensitive? (deadlines, dependencies, risk of delay)</dd>
+          </div>
+        </dl>
+        <p className="muted tiny">
+          ICE score ≈ I × C × E (weighted). IU = ICE × U.{" "}
+          <a
+            href="https://itamargilad.com/the-tool-that-will-help-you-choose-better-product-ideas/"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            Full ICE article →
+          </a>
+        </p>
+      </div>
+    );
+  }
+
   function TodayView() {
     const plan = state.today;
     const workPool = pickerTasks("work");
     const lifePool = pickerTasks("life");
+    const workSubPool = pickerSubtasks("work");
+    const lifeSubPool = pickerSubtasks("life");
     const mainTask = plan.mainTaskId ? taskById.get(plan.mainTaskId) : null;
     const hoursPct = Math.min(100, Math.round((plan.mainHoursLogged / 3) * 100));
+    const mainDone = plan.mainDone || (mainTask?.completed ?? false);
+
+    const usedRefKeys = new Set(
+      [
+        ...plan.workSlots.map((s) => slotRefKey(s.ref)),
+        ...plan.lifeSlots.map((s) => slotRefKey(s.ref)),
+        plan.mainTaskId ? `task:${plan.mainTaskId}` : null,
+      ].filter(Boolean) as string[]
+    );
+
+    const printToday = () => {
+      document.body.classList.add("printing-today");
+      window.print();
+      window.setTimeout(() => document.body.classList.remove("printing-today"), 500);
+    };
 
     const slotRow = (
-      label: string,
-      slotKey: "workSlotIds" | "lifeSlotIds",
+      slotKey: "workSlots" | "lifeSlots",
+      mode: TodayPickMode,
       pool: Task[],
+      subPool: { key: string; ref: TodaySlotRef; label: string }[],
       idx: number
     ) => {
-      const slotId = plan[slotKey][idx];
-      const slotTask = slotId ? taskById.get(slotId) : null;
-      const usedElsewhere = new Set(
-        [...plan.workSlotIds, ...plan.lifeSlotIds, plan.mainTaskId].filter(Boolean) as string[]
-      );
+      const slot = plan[slotKey][idx];
+      const label = slotLabel(slot.ref);
+      const optionValue = slotRefKey(slot.ref) || "";
+
+      if (slot.done && slot.ref) {
+        return (
+          <div key={`${slotKey}-${idx}`} className="today-slot done">
+            <span className="slot-num">{idx + 1}</span>
+            <span className="today-slot-done-label">{label}</span>
+            <button
+              className="check"
+              onClick={() => {
+                const next = [...plan[slotKey]];
+                next[idx] = { ...slot, done: false };
+                updateToday({ [slotKey]: next });
+              }}
+              title="Mark not done for today"
+            >
+              <CheckSquare size={16} />
+            </button>
+          </div>
+        );
+      }
+
       return (
-        <div key={`${slotKey}-${idx}`} className={`today-slot ${slotTask?.completed ? "done" : ""}`}>
+        <div key={`${slotKey}-${idx}`} className="today-slot">
           <span className="slot-num">{idx + 1}</span>
           <select
-            value={slotId || ""}
+            value={optionValue}
             onChange={(e) => {
               const next = [...plan[slotKey]];
-              next[idx] = e.target.value || null;
+              next[idx] = { ref: parseSlotOption(e.target.value), done: false };
               updateToday({ [slotKey]: next });
             }}
           >
-            <option value="">Pick a task…</option>
-            {pool.map((t) => (
-              <option
-                key={t.id}
-                value={t.id}
-                disabled={usedElsewhere.has(t.id) && t.id !== slotId}
-              >
-                {t.title}
-              </option>
-            ))}
+            <option value="">Pick a {mode === "subtasks" ? "subtask" : "task"}…</option>
+            {mode === "tasks"
+              ? pool.map((t) => {
+                  const key = `task:${t.id}`;
+                  return (
+                    <option key={t.id} value={key} disabled={usedRefKeys.has(key) && key !== optionValue}>
+                      {t.title}
+                    </option>
+                  );
+                })
+              : subPool.map((row) => (
+                  <option
+                    key={row.key}
+                    value={row.key}
+                    disabled={usedRefKeys.has(row.key) && row.key !== optionValue}
+                  >
+                    {row.label}
+                  </option>
+                ))}
           </select>
-          {slotTask && (
+          {slot.ref && (
             <button
               className="check"
-              onClick={() => updateTask(slotTask.id, { completed: !slotTask.completed })}
-              title={slotTask.completed ? "Mark incomplete" : "Mark complete"}
+              onClick={() => {
+                const next = [...plan[slotKey]];
+                next[idx] = { ...slot, done: true };
+                updateToday({ [slotKey]: next });
+              }}
+              title="Done for today"
             >
-              {slotTask.completed ? <CheckSquare size={16} /> : <Square size={16} />}
+              <Square size={16} />
             </button>
           )}
         </div>
       );
     };
 
+    const printDate = new Date().toLocaleDateString(undefined, {
+      weekday: "long",
+      year: "numeric",
+      month: "long",
+      day: "numeric",
+    });
+
     return (
       <div className="today-page">
-        <div className="today-header">
-          <h2>Today — 3·3·3</h2>
-          <p className="muted tiny">
-            3 hours on your main task · 3 work tasks · 3 life tasks · Resets each day
-          </p>
+        <div className="today-header row between wrap">
+          <div>
+            <h2>Today — 3·3·3</h2>
+            <p className="muted tiny">
+              3 hours on your main task · 3 work · 3 life · Completed items stay crossed off until tomorrow
+            </p>
+          </div>
+          <button className="tiny" onClick={printToday} title="Print or save as PDF">
+            <Printer size={14} /> Print / PDF
+          </button>
         </div>
 
-        <section className="today-section today-main-block">
-          <h3>Deep work — 3 hours</h3>
-          <p className="muted tiny">One main task to protect your focus block.</p>
-          <select
-            className="today-select"
-            value={plan.mainTaskId || ""}
-            onChange={(e) =>
-              updateToday({
-                mainTaskId: e.target.value || null,
-                mainHoursLogged: 0,
-              })
-            }
-          >
-            <option value="">Choose main task…</option>
-            {workPool.map((t) => (
-              <option key={t.id} value={t.id}>
-                {t.title}
-              </option>
-            ))}
-          </select>
-          {mainTask && (
-            <div className="hours-tracker">
-              <div className="hours-bar">
-                <div className="hours-fill" style={{ width: `${hoursPct}%` }} />
-              </div>
-              <div className="row gap wrap">
+        <div ref={todayPrintRef} className="today-print-sheet">
+          <div className="today-print-only">
+            <h1>Today — 3·3·3</h1>
+            <p>{printDate}</p>
+          </div>
+
+          <section className="today-section today-main-block">
+            <h3>Deep work — 3 hours</h3>
+            <p className="muted tiny screen-only">One main task to protect your focus block.</p>
+            {mainDone && mainTask ? (
+              <div className="today-slot done today-main-done">
+                <span className="today-slot-done-label">{mainTask.title}</span>
                 <span className="muted tiny">
-                  {plan.mainHoursLogged.toFixed(1)} / 3 h — {mainTask.title}
+                  {plan.mainHoursLogged.toFixed(1)} / 3 h logged
                 </span>
-                <div className="row gap">
-                  <button
-                    className="tiny"
-                    onClick={() =>
-                      updateToday({ mainHoursLogged: Math.min(3, plan.mainHoursLogged + 0.5) })
-                    }
-                  >
-                    +30m
-                  </button>
-                  <button
-                    className="tiny"
-                    onClick={() =>
-                      updateToday({ mainHoursLogged: Math.min(3, plan.mainHoursLogged + 1) })
-                    }
-                  >
-                    +1h
-                  </button>
-                  <button className="tiny" onClick={() => updateToday({ mainHoursLogged: 0 })}>
-                    Reset
-                  </button>
-                </div>
               </div>
+            ) : (
+              <>
+                <select
+                  className="today-select screen-only"
+                  value={plan.mainTaskId || ""}
+                  onChange={(e) =>
+                    updateToday({
+                      mainTaskId: e.target.value || null,
+                      mainHoursLogged: 0,
+                      mainDone: false,
+                    })
+                  }
+                >
+                  <option value="">Choose main task…</option>
+                  {workPool.map((t) => (
+                    <option key={t.id} value={t.id}>
+                      {t.title}
+                    </option>
+                  ))}
+                </select>
+                {mainTask && (
+                  <div className="hours-tracker screen-only">
+                    <div className="hours-bar">
+                      <div className="hours-fill" style={{ width: `${hoursPct}%` }} />
+                    </div>
+                    <div className="row gap wrap">
+                      <span className="muted tiny">
+                        {plan.mainHoursLogged.toFixed(1)} / 3 h — {mainTask.title}
+                      </span>
+                      <div className="row gap">
+                        <button
+                          className="tiny"
+                          onClick={() =>
+                            updateToday({ mainHoursLogged: Math.min(3, plan.mainHoursLogged + 0.5) })
+                          }
+                        >
+                          +30m
+                        </button>
+                        <button
+                          className="tiny"
+                          onClick={() =>
+                            updateToday({ mainHoursLogged: Math.min(3, plan.mainHoursLogged + 1) })
+                          }
+                        >
+                          +1h
+                        </button>
+                        <button className="tiny" onClick={() => updateToday({ mainHoursLogged: 0 })}>
+                          Reset
+                        </button>
+                        <button
+                          className="tiny"
+                          onClick={() => updateToday({ mainDone: true })}
+                          title="Mark deep work block done for today"
+                        >
+                          Done
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </>
+            )}
+            <div className="today-print-only print-line">
+              <strong>Deep work:</strong>{" "}
+              {mainTask ? (
+                <span className={mainDone ? "print-struck" : ""}>{mainTask.title}</span>
+              ) : (
+                "_______________________________"
+              )}{" "}
+              ({plan.mainHoursLogged.toFixed(1)} / 3 h)
             </div>
-          )}
-        </section>
+          </section>
 
-        <div className="today-grid">
-          <section className="today-section">
-            <h3>
-              <Briefcase size={16} /> 3 work tasks
-            </h3>
-            {[0, 1, 2].map((i) => slotRow("work", "workSlotIds", workPool, i))}
-          </section>
-          <section className="today-section">
-            <h3>
-              <Home size={16} /> 3 life tasks
-            </h3>
-            {[0, 1, 2].map((i) => slotRow("life", "lifeSlotIds", lifePool, i))}
-          </section>
+          <div className="today-grid">
+            <section className="today-section">
+              <div className="row between wrap today-section-head">
+                <h3>
+                  <Briefcase size={16} /> 3 work
+                </h3>
+                <label className="tiny today-mode screen-only">
+                  Pick
+                  <select
+                    value={plan.workMode}
+                    onChange={(e) =>
+                      updateToday({
+                        workMode: e.target.value as TodayPickMode,
+                        workSlots: emptyTodaySlots(),
+                      })
+                    }
+                  >
+                    <option value="tasks">Full tasks</option>
+                    <option value="subtasks">Subtasks</option>
+                  </select>
+                </label>
+              </div>
+              {[0, 1, 2].map((i) =>
+                slotRow("workSlots", plan.workMode, workPool, workSubPool, i)
+              )}
+              <ol className="today-print-only">
+                {plan.workSlots.map((s, i) => (
+                  <li key={i} className={s.done ? "print-struck" : ""}>
+                    {s.ref ? slotLabel(s.ref) : "_______________________________"}
+                  </li>
+                ))}
+              </ol>
+            </section>
+            <section className="today-section">
+              <div className="row between wrap today-section-head">
+                <h3>
+                  <Home size={16} /> 3 life
+                </h3>
+                <label className="tiny today-mode screen-only">
+                  Pick
+                  <select
+                    value={plan.lifeMode}
+                    onChange={(e) =>
+                      updateToday({
+                        lifeMode: e.target.value as TodayPickMode,
+                        lifeSlots: emptyTodaySlots(),
+                      })
+                    }
+                  >
+                    <option value="tasks">Full tasks</option>
+                    <option value="subtasks">Subtasks</option>
+                  </select>
+                </label>
+              </div>
+              {[0, 1, 2].map((i) =>
+                slotRow("lifeSlots", plan.lifeMode, lifePool, lifeSubPool, i)
+              )}
+              <ol className="today-print-only">
+                {plan.lifeSlots.map((s, i) => (
+                  <li key={i} className={s.done ? "print-struck" : ""}>
+                    {s.ref ? slotLabel(s.ref) : "_______________________________"}
+                  </li>
+                ))}
+              </ol>
+            </section>
+          </div>
         </div>
 
-        <p className="muted tiny today-hint">
+        <p className="muted tiny today-hint screen-only">
           Shortcuts on boards: <kbd>N</kbd> new task · <kbd>/</kbd> search · <kbd>1</kbd>
           <kbd>2</kbd>
           <kbd>3</kbd> jump columns
@@ -2299,6 +2588,9 @@ export default function App() {
           </div>
         </header>
 
+        {/* ICE guide on Work / Life boards */}
+        {(state.section === "work" || state.section === "life") && <IceHelpPanel />}
+
         {/* Toolbar */}
         {state.section !== "today" && (
         <div className="toolbar">
@@ -2661,4 +2953,42 @@ svg .muted { fill: var(--muted); }
 .hours-bar { height: 8px; background: var(--border); border-radius: 999px; overflow: hidden; }
 .hours-fill { height: 100%; background: var(--accent); border-radius: 999px; transition: width 0.2s ease; }
 .today-hint kbd { font: inherit; font-size: 10px; padding: 1px 5px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-elev); }
+.today-slot.done .today-slot-done-label { text-decoration: line-through; opacity: 0.75; color: var(--muted); }
+.today-slot-done-label { flex: 1; min-width: 0; padding: 8px 0; }
+.today-section-head { margin-bottom: 4px; align-items: center; }
+.today-mode { display: inline-flex; align-items: center; gap: 6px; }
+.today-mode select { padding: 4px 8px; border-radius: 8px; border: 1px solid var(--border); background: var(--card); }
+.today-header { align-items: flex-start; margin-bottom: 4px; }
+
+.ice-help {
+  margin: 0 0 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-elev);
+}
+.ice-help-lead { margin: 6px 0 10px; }
+.ice-defs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 16px; margin: 0 0 10px; }
+.ice-defs dt { font-weight: 600; font-size: 12px; margin: 0; }
+.ice-defs dd { margin: 2px 0 0; font-size: 11px; color: var(--muted); }
+@media (max-width: 720px) { .ice-defs { grid-template-columns: 1fr; } }
+
+.today-print-only { display: none; }
+.screen-only { display: block; }
+.print-struck { text-decoration: line-through; }
+
+@media print {
+  .dev-banner, .header, .toolbar, .learn-footer, .today-hint, .screen-only, .ice-help { display: none !important; }
+  .today-print-only { display: block !important; }
+  .today-print-sheet { max-width: 100%; }
+  .today-page { max-width: 100%; padding: 0; }
+  .today-section { break-inside: avoid; border: 1px solid #ccc; margin-bottom: 12px; }
+  .today-grid { display: block; }
+  .today-grid .today-section { margin-bottom: 16px; }
+  .today-print-only h1 { font-size: 22px; margin: 0 0 4px; }
+  .today-print-only ol { margin: 8px 0 0; padding-left: 20px; }
+  .today-print-only li { margin: 6px 0; font-size: 14px; }
+  body { background: #fff; color: #111; }
+}
+body.printing-today .app { padding: 0; }
 `;
