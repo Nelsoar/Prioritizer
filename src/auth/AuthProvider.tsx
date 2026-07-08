@@ -9,6 +9,8 @@ type AuthContextValue = {
   avatarUrl: string | null;
   setAvatarUrl: (url: string) => Promise<void>;
   signOut: () => Promise<void>;
+  openAuth: () => void;
+  closeAuth: () => void;
   authReady: boolean;
   supabaseConfigured: boolean;
 };
@@ -31,6 +33,7 @@ function avatarFromUser(user: User | null): string | null {
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [session, setSession] = useState<Session | null>(null);
+  const [authOpen, setAuthOpen] = useState(false);
   const [localAvatar, setLocalAvatar] = useState<string | null>(() =>
     localStorage.getItem("profile-avatar-local")
   );
@@ -56,6 +59,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return () => sub.subscription.unsubscribe();
   }, []);
 
+  useEffect(() => {
+    if (session) setAuthOpen(false);
+  }, [session]);
+
   const setAvatarUrl = async (url: string) => {
     const uid = session?.user?.id;
     if (uid) {
@@ -78,16 +85,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     avatarUrl,
     setAvatarUrl,
     signOut,
+    openAuth: () => setAuthOpen(true),
+    closeAuth: () => setAuthOpen(false),
     authReady,
     supabaseConfigured,
   };
 
-  if (supabaseConfigured && authReady && !session) {
-    return <AuthScreen />;
-  }
-
   return (
     <AuthContext.Provider value={value}>
+      {authOpen && !session && supabaseConfigured && (
+        <AuthScreen onClose={() => setAuthOpen(false)} />
+      )}
       <input
         ref={fileRef}
         type="file"

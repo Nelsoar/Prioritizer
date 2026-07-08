@@ -1,7 +1,8 @@
 import React, { useState } from "react";
+import { X } from "lucide-react";
 import { supabase } from "../lib/supabase";
 
-export function AuthScreen() {
+export function AuthScreen({ onClose }: { onClose: () => void }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [mode, setMode] = useState<"signin" | "signup">("signin");
@@ -32,12 +33,15 @@ export function AuthScreen() {
   };
 
   return (
-    <div className="auth-page">
+    <div className="auth-overlay" onClick={onClose} role="presentation">
       <style>{authCss}</style>
-      <div className="auth-card">
+      <div className="auth-card" onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true">
+        <button type="button" className="auth-close" onClick={onClose} title="Close">
+          <X size={18} />
+        </button>
         <img src="/parhelia-logo.png" alt="Parhelia Bio" className="auth-brand" />
         <h1>Now / Next / Later</h1>
-        <p className="muted tiny">Sign in to sync boards with your team.</p>
+        <p className="muted tiny">Sign in to sync boards across devices (optional).</p>
 
         <form onSubmit={submit} className="auth-form">
           <label>
@@ -85,17 +89,21 @@ export function AuthScreen() {
 }
 
 const authCss = `
-.auth-page {
-  min-height: 100vh;
+.auth-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
   display: flex;
   align-items: center;
   justify-content: center;
   padding: 24px;
-  background: #0b1423;
+  background: rgba(8, 12, 24, 0.72);
+  backdrop-filter: blur(4px);
   color: #e5f2ff;
   font: 14px/1.4 ui-sans-serif, system-ui, sans-serif;
 }
 .auth-card {
+  position: relative;
   width: 100%;
   max-width: 380px;
   background: #0f1a2b;
@@ -106,6 +114,17 @@ const authCss = `
   flex-direction: column;
   gap: 12px;
   align-items: center;
+  box-shadow: 0 24px 48px rgba(0,0,0,0.45);
+}
+.auth-close {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  border: none;
+  background: transparent;
+  color: #9fb6d1;
+  cursor: pointer;
+  padding: 4px;
 }
 .auth-brand { height: 48px; width: auto; object-fit: contain; }
 .auth-card h1 { font-size: 20px; margin: 0; }

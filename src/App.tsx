@@ -6,6 +6,8 @@ import {
   Droppable,
   DropResult,
 } from "@hello-pangea/dnd";
+import { jsPDF } from "jspdf";
+import html2canvas from "html2canvas";
 import {
   Plus,
   Trash2,
@@ -22,16 +24,18 @@ import {
   Home,
   Archive,
   LogOut,
+  LogIn,
   Printer,
   HelpCircle,
 } from "lucide-react";
 import { useAuth, useProfilePicker } from "./auth/AuthProvider";
+import { Celebration } from "./components/Celebration";
 
 /* =======================
    Types
 ======================= */
 type Status = "now" | "next" | "later";
-type Theme = "light" | "dark" | "ocean" | "forest";
+type Theme = "light" | "dark" | "ocean" | "forest" | "rainbow";
 type BoardKind = "work" | "life";
 type Section = "today" | "work" | "life";
 
@@ -83,16 +87,19 @@ type TodaySlotRef =
   | { kind: "task"; taskId: string }
   | { kind: "subtask"; taskId: string; subtaskId: string };
 type TodaySlot = { ref: TodaySlotRef | null; done: boolean };
+type TodaySimpleTodo = { id: string; title: string; done: boolean };
 
 type TodayPlan = {
   date: string;
-  mainTaskId: string | null;
+  mainRef: TodaySlotRef | null;
   mainDone: boolean;
   mainHoursLogged: number;
   workMode: TodayPickMode;
   lifeMode: TodayPickMode;
   workSlots: TodaySlot[];
   lifeSlots: TodaySlot[];
+  simpleTodos: TodaySimpleTodo[];
+  inspirationalQuote: string;
   /** @deprecated migrated to workSlots */
   workSlotIds?: (string | null)[];
   /** @deprecated migrated to lifeSlots */
@@ -118,6 +125,8 @@ type AppState = {
   section: Section;
   showArchived: boolean;
   today: TodayPlan;
+  celebrationsEnabled: boolean;
+  celebrationPromptShown: boolean;
 };
 
 /* =======================
@@ -146,6 +155,14 @@ function loadPersistedState(key: string): Partial<AppState> | null {
   return safeParse<Partial<AppState>>(raw);
 }
 
+function uid(): string {
+  try {
+    const c = (globalThis as any).crypto;
+    if (c?.randomUUID) return c.randomUUID();
+  } catch {}
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 function buildAppState(persisted: Partial<AppState> | null): AppState {
   const theme = (persisted?.theme as Theme) || "ocean";
   const rawTasks = Array.isArray(persisted?.tasks)
@@ -171,10 +188,20 @@ function buildAppState(persisted: Partial<AppState> | null): AppState {
     thresholds: persisted?.thresholds || { imp: 0, urg: 0 },
     theme,
     search: "",
+    celebrationsEnabled: persisted?.celebrationsEnabled ?? true,
+    celebrationPromptShown: persisted?.celebrationPromptShown ?? false,
   };
 }
 
-const uid = () => Math.random().toString(36).slice(2) + "-" + Date.now().toString(36);
+const DEFAULT_TASK_SCORE = 3;
+const DEFAULT_INSPIRATIONAL_QUOTE =
+  '"Joy is what happens to us when we allow ourselves to recognize how good things really are." — Marianne Williamson';
+
+const hasDefaultScores = (t: Task) =>
+  t.impact === DEFAULT_TASK_SCORE &&
+  t.confidence === DEFAULT_TASK_SCORE &&
+  t.ease === DEFAULT_TASK_SCORE &&
+  t.urgency === DEFAULT_TASK_SCORE;
 const todayDateKey = () => {
   const d = new Date();
   const pad = (n: number) => String(n).padStart(2, "0");
@@ -187,13 +214,15 @@ const emptyTodaySlots = (): TodaySlot[] => [
 ];
 const emptyTodayPlan = (): TodayPlan => ({
   date: todayDateKey(),
-  mainTaskId: null,
+  mainRef: null,
   mainDone: false,
   mainHoursLogged: 0,
   workMode: "tasks",
   lifeMode: "tasks",
   workSlots: emptyTodaySlots(),
   lifeSlots: emptyTodaySlots(),
+  simpleTodos: [],
+  inspirationalQuote: DEFAULT_INSPIRATIONAL_QUOTE,
 });
 const normalizeSlots = (
   slots: TodaySlot[] | undefined,
@@ -216,13 +245,25 @@ const normalizeTodayPlan = (plan: Partial<TodayPlan> | undefined): TodayPlan => 
   if (!plan || plan.date !== today) return emptyTodayPlan();
   return {
     date: today,
-    mainTaskId: plan.mainTaskId ?? null,
+    mainRef:
+      plan.mainRef ??
+      ((plan as { mainTaskId?: string | null }).mainTaskId
+        ? { kind: "task", taskId: (plan as { mainTaskId: string }).mainTaskId }
+        : null),
     mainDone: !!plan.mainDone,
     mainHoursLogged: numOr(plan.mainHoursLogged, 0),
     workMode: plan.workMode === "subtasks" ? "subtasks" : "tasks",
     lifeMode: plan.lifeMode === "subtasks" ? "subtasks" : "tasks",
     workSlots: normalizeSlots(plan.workSlots, plan.workSlotIds),
     lifeSlots: normalizeSlots(plan.lifeSlots, plan.lifeSlotIds),
+    simpleTodos: Array.isArray(plan.simpleTodos)
+      ? plan.simpleTodos.map((t) => ({
+          id: t?.id || uid(),
+          title: String(t?.title || "").trim() || "To-do",
+          done: !!t?.done,
+        }))
+      : [],
+    inspirationalQuote: plan.inspirationalQuote?.trim() || DEFAULT_INSPIRATIONAL_QUOTE,
   };
 };
 const normalizeTask = (t: Task): Task => ({
@@ -242,6 +283,13 @@ const parseSlotOption = (val: string): TodaySlotRef | null => {
   if (parts.length === 2) return { kind: "subtask", taskId: parts[0], subtaskId: parts[1] };
   return null;
 };
+const refCompleted = (ref: TodaySlotRef | null, tasks: Task[]): boolean => {
+  if (!ref) return false;
+  const parent = tasks.find((t) => t.id === ref.taskId);
+  if (!parent) return false;
+  if (ref.kind === "task") return !!parent.completed;
+  return !!(parent.children || []).find((c) => c.id === ref.subtaskId)?.completed;
+};
 const markTodayDoneForTask = (plan: TodayPlan, taskId: string): TodayPlan => {
   const mark = (slot: TodaySlot): TodaySlot => {
     if (!slot.ref) return slot;
@@ -249,9 +297,11 @@ const markTodayDoneForTask = (plan: TodayPlan, taskId: string): TodayPlan => {
     if (slot.ref.kind === "subtask" && slot.ref.taskId === taskId) return { ...slot, done: true };
     return slot;
   };
+  const mainMatches =
+    plan.mainRef?.kind === "task" && plan.mainRef.taskId === taskId;
   return {
     ...plan,
-    mainDone: plan.mainTaskId === taskId ? true : plan.mainDone,
+    mainDone: mainMatches ? true : plan.mainDone,
     workSlots: plan.workSlots.map(mark),
     lifeSlots: plan.lifeSlots.map(mark),
   };
@@ -263,11 +313,12 @@ const clearTodayRefsForTask = (plan: TodayPlan, taskId: string): TodayPlan => {
     if (slot.ref.taskId === taskId) return { ref: null, done: false };
     return slot;
   };
+  const clearMain = plan.mainRef?.taskId === taskId ? null : plan.mainRef;
   return {
     ...plan,
-    mainTaskId: plan.mainTaskId === taskId ? null : plan.mainTaskId,
-    mainDone: plan.mainTaskId === taskId ? false : plan.mainDone,
-    mainHoursLogged: plan.mainTaskId === taskId ? 0 : plan.mainHoursLogged,
+    mainRef: clearMain,
+    mainDone: clearMain ? plan.mainDone : false,
+    mainHoursLogged: clearMain ? plan.mainHoursLogged : 0,
     workSlots: plan.workSlots.map(clear),
     lifeSlots: plan.lifeSlots.map(clear),
   };
@@ -649,13 +700,16 @@ class ErrorBoundary extends React.Component<
    App
 ======================= */
 export default function App() {
-  const { user, avatarUrl, signOut, supabaseConfigured: authOn } = useAuth();
+  const { user, avatarUrl, signOut, openAuth, supabaseConfigured: authOn } = useAuth();
   const { openPicker } = useProfilePicker();
   const storageKey = storageKeyForUser(user?.id);
   const profileInitial = user?.email?.[0]?.toUpperCase() || (authOn ? "?" : "P");
 
   const [state, setState] = useState<AppState>(() => buildAppState(loadPersistedState(storageKey)));
   const [hasLoaded, setHasLoaded] = useState(false);
+  const [celebrationOpen, setCelebrationOpen] = useState(false);
+  const [celebrationTick, setCelebrationTick] = useState(0);
+  const [helpOpen, setHelpOpen] = useState(false);
   const searchRef = useRef<HTMLInputElement>(null);
   const columnRefs = useRef<Record<Status, HTMLDivElement | null>>({
     now: null,
@@ -775,8 +829,9 @@ export default function App() {
     return fields.some((f) => f.toLowerCase().includes(s));
   }
 
-  const effectivelyCompleted = (t: Task) =>
-    t.completed && !(t.children || []).some((c) => !c.completed);
+  // If a task is marked complete, it should be treated as "done" for filtering,
+  // regardless of unfinished subtasks.
+  const effectivelyCompleted = (t: Task) => !!t.completed;
 
   // Sort
   function sortTasks(list: Task[]): Task[] {
@@ -858,6 +913,12 @@ export default function App() {
     return incomingCount <= limit;
   }
 
+  const fireCelebration = () => {
+    if (!state.celebrationsEnabled) return;
+    setCelebrationTick((t) => t + 1);
+    setCelebrationOpen(true);
+  };
+
   // Mutators
   const updateTask = (id: string, patch: Partial<Task>) =>
     setStatePreserveScroll((s) => ({
@@ -865,6 +926,27 @@ export default function App() {
       today: patch.completed === true ? markTodayDoneForTask(s.today, id) : s.today,
       tasks: s.tasks.map((t) => (t.id === id ? { ...t, ...patch, updatedAt: Date.now() } : t)),
     }));
+
+  const toggleTaskComplete = (id: string) => {
+    const task = taskById.get(id);
+    if (!task) return;
+    const next = !task.completed;
+    if (next) fireCelebration();
+    updateTask(id, { completed: next });
+  };
+
+  const toggleSubtaskComplete = (taskId: string, subtaskId: string) => {
+    const task = taskById.get(taskId);
+    if (!task) return;
+    const sub = (task.children || []).find((c) => c.id === subtaskId);
+    if (!sub) return;
+    const next = !sub.completed;
+    if (next) fireCelebration();
+    const arr = (task.children || []).map((x) =>
+      x.id === subtaskId ? { ...x, completed: next, updatedAt: Date.now() } : x
+    );
+    updateTask(taskId, { children: arr });
+  };
 
   const addTask = (status: Status, title = "New task", board?: BoardKind) => {
     const now = Date.now();
@@ -878,10 +960,10 @@ export default function App() {
       title,
       status,
       board: boardKind,
-      impact: 5,
-      confidence: 5,
-      ease: 5,
-      urgency: 5,
+      impact: DEFAULT_TASK_SCORE,
+      confidence: DEFAULT_TASK_SCORE,
+      ease: DEFAULT_TASK_SCORE,
+      urgency: DEFAULT_TASK_SCORE,
       completed: false,
       order: maxOrder,
       createdAt: now,
@@ -1422,33 +1504,124 @@ export default function App() {
     );
   }
 
+  const slotPickerOptions = (
+    pool: Task[],
+    subPool: { key: string; ref: TodaySlotRef; label: string }[],
+    usedRefKeys: Set<string>,
+    currentValue: string
+  ) => (
+    <>
+      {pool.length > 0 && (
+        <optgroup label="Tasks">
+          {pool.map((t) => {
+            const key = `task:${t.id}`;
+            return (
+              <option key={t.id} value={key} disabled={usedRefKeys.has(key) && key !== currentValue}>
+                {t.title}
+              </option>
+            );
+          })}
+        </optgroup>
+      )}
+      {subPool.length > 0 && (
+        <optgroup label="Subtasks">
+          {subPool.map((row) => (
+            <option
+              key={row.key}
+              value={row.key}
+              disabled={usedRefKeys.has(row.key) && row.key !== currentValue}
+            >
+              {row.label}
+            </option>
+          ))}
+        </optgroup>
+      )}
+    </>
+  );
+
   function TodayView() {
     const plan = state.today;
+    const [todoDraft, setTodoDraft] = useState("");
     const workPool = pickerTasks("work");
     const lifePool = pickerTasks("life");
     const workSubPool = pickerSubtasks("work");
     const lifeSubPool = pickerSubtasks("life");
-    const mainTask = plan.mainTaskId ? taskById.get(plan.mainTaskId) : null;
+    const mainLabel = slotLabel(plan.mainRef);
     const hoursPct = Math.min(100, Math.round((plan.mainHoursLogged / 3) * 100));
-    const mainDone = plan.mainDone || (mainTask?.completed ?? false);
+    const mainDone = plan.mainDone || refCompleted(plan.mainRef, state.tasks);
+    const mainRefKey = slotRefKey(plan.mainRef) || "";
 
     const usedRefKeys = new Set(
       [
         ...plan.workSlots.map((s) => slotRefKey(s.ref)),
         ...plan.lifeSlots.map((s) => slotRefKey(s.ref)),
-        plan.mainTaskId ? `task:${plan.mainTaskId}` : null,
+        slotRefKey(plan.mainRef),
       ].filter(Boolean) as string[]
     );
 
-    const printToday = () => {
-      document.body.classList.add("printing-today");
-      window.print();
-      window.setTimeout(() => document.body.classList.remove("printing-today"), 500);
+    const downloadTodayPdf = async () => {
+      const node = todayPrintRef.current;
+      if (!node) return;
+
+      // Render at higher scale for legibility in PDF.
+      const canvas = await html2canvas(node, {
+        backgroundColor: "#ffffff",
+        scale: 2,
+        useCORS: true,
+      });
+      const imgData = canvas.toDataURL("image/png");
+
+      const pdf = new jsPDF({ orientation: "p", unit: "pt", format: "letter" });
+      const pageWidth = pdf.internal.pageSize.getWidth();
+      const pageHeight = pdf.internal.pageSize.getHeight();
+
+      const imgWidth = pageWidth;
+      const imgHeight = (canvas.height * imgWidth) / canvas.width;
+
+      let y = 0;
+      let remaining = imgHeight;
+      while (remaining > 0) {
+        pdf.addImage(imgData, "PNG", 0, y, imgWidth, imgHeight);
+        remaining -= pageHeight;
+        if (remaining > 0) {
+          pdf.addPage();
+          y -= pageHeight;
+        }
+      }
+
+      const name = `today-${todayDateKey()}.pdf`;
+      pdf.save(name);
+    };
+
+    const addSimpleTodo = () => {
+      const title = todoDraft.trim();
+      if (!title) return;
+      updateToday({
+        simpleTodos: [...plan.simpleTodos, { id: uid(), title, done: false }],
+      });
+      setTodoDraft("");
+    };
+
+    const toggleSimpleTodo = (id: string) => {
+      const item = plan.simpleTodos.find((t) => t.id === id);
+      if (item && !item.done) fireCelebration();
+      updateToday({
+        simpleTodos: plan.simpleTodos.map((t) => (t.id === id ? { ...t, done: !t.done } : t)),
+      });
+    };
+
+    const updateSimpleTodoTitle = (id: string, title: string) => {
+      updateToday({
+        simpleTodos: plan.simpleTodos.map((t) => (t.id === id ? { ...t, title: title.trim() || t.title } : t)),
+      });
+    };
+
+    const deleteSimpleTodo = (id: string) => {
+      updateToday({ simpleTodos: plan.simpleTodos.filter((t) => t.id !== id) });
     };
 
     const slotRow = (
       slotKey: "workSlots" | "lifeSlots",
-      mode: TodayPickMode,
       pool: Task[],
       subPool: { key: string; ref: TodaySlotRef; label: string }[],
       idx: number
@@ -1488,30 +1661,14 @@ export default function App() {
               updateToday({ [slotKey]: next });
             }}
           >
-            <option value="">Pick a {mode === "subtasks" ? "subtask" : "task"}…</option>
-            {mode === "tasks"
-              ? pool.map((t) => {
-                  const key = `task:${t.id}`;
-                  return (
-                    <option key={t.id} value={key} disabled={usedRefKeys.has(key) && key !== optionValue}>
-                      {t.title}
-                    </option>
-                  );
-                })
-              : subPool.map((row) => (
-                  <option
-                    key={row.key}
-                    value={row.key}
-                    disabled={usedRefKeys.has(row.key) && row.key !== optionValue}
-                  >
-                    {row.label}
-                  </option>
-                ))}
+            <option value="">Pick a task or subtask…</option>
+            {slotPickerOptions(pool, subPool, usedRefKeys, optionValue)}
           </select>
           {slot.ref && (
             <button
               className="check"
               onClick={() => {
+                fireCelebration();
                 const next = [...plan[slotKey]];
                 next[idx] = { ...slot, done: true };
                 updateToday({ [slotKey]: next });
@@ -1536,13 +1693,13 @@ export default function App() {
       <div className="today-page">
         <div className="today-header row between wrap">
           <div>
-            <h2>Today — 3·3·3</h2>
+            <h2 className="spectrum-text">Today — 3·3·3</h2>
             <p className="muted tiny">
               3 hours on your main task · 3 work · 3 life · Completed items stay crossed off until tomorrow
             </p>
           </div>
-          <button className="tiny" onClick={printToday} title="Print or save as PDF">
-            <Printer size={14} /> Print / PDF
+          <button className="tiny" onClick={() => void downloadTodayPdf()} title="Download a PDF">
+            <Printer size={14} /> Download PDF
           </button>
         </div>
 
@@ -1555,9 +1712,9 @@ export default function App() {
           <section className="today-section today-main-block">
             <h3>Deep work — 3 hours</h3>
             <p className="muted tiny screen-only">One main task to protect your focus block.</p>
-            {mainDone && mainTask ? (
+            {mainDone && plan.mainRef ? (
               <div className="today-slot done today-main-done">
-                <span className="today-slot-done-label">{mainTask.title}</span>
+                <span className="today-slot-done-label">{mainLabel}</span>
                 <span className="muted tiny">
                   {plan.mainHoursLogged.toFixed(1)} / 3 h logged
                 </span>
@@ -1566,30 +1723,26 @@ export default function App() {
               <>
                 <select
                   className="today-select screen-only"
-                  value={plan.mainTaskId || ""}
+                  value={mainRefKey}
                   onChange={(e) =>
                     updateToday({
-                      mainTaskId: e.target.value || null,
+                      mainRef: parseSlotOption(e.target.value),
                       mainHoursLogged: 0,
                       mainDone: false,
                     })
                   }
                 >
-                  <option value="">Choose main task…</option>
-                  {workPool.map((t) => (
-                    <option key={t.id} value={t.id}>
-                      {t.title}
-                    </option>
-                  ))}
+                  <option value="">Choose main task or subtask…</option>
+                  {slotPickerOptions(workPool, workSubPool, usedRefKeys, mainRefKey)}
                 </select>
-                {mainTask && (
+                {plan.mainRef && (
                   <div className="hours-tracker screen-only">
                     <div className="hours-bar">
                       <div className="hours-fill" style={{ width: `${hoursPct}%` }} />
                     </div>
                     <div className="row gap wrap">
                       <span className="muted tiny">
-                        {plan.mainHoursLogged.toFixed(1)} / 3 h — {mainTask.title}
+                        {plan.mainHoursLogged.toFixed(1)} / 3 h — {mainLabel}
                       </span>
                       <div className="row gap">
                         <button
@@ -1613,7 +1766,10 @@ export default function App() {
                         </button>
                         <button
                           className="tiny"
-                          onClick={() => updateToday({ mainDone: true })}
+                          onClick={() => {
+                            fireCelebration();
+                            updateToday({ mainDone: true });
+                          }}
                           title="Mark deep work block done for today"
                         >
                           Done
@@ -1626,8 +1782,8 @@ export default function App() {
             )}
             <div className="today-print-only print-line">
               <strong>Deep work:</strong>{" "}
-              {mainTask ? (
-                <span className={mainDone ? "print-struck" : ""}>{mainTask.title}</span>
+              {plan.mainRef ? (
+                <span className={mainDone ? "print-struck" : ""}>{mainLabel}</span>
               ) : (
                 "_______________________________"
               )}{" "}
@@ -1637,29 +1793,12 @@ export default function App() {
 
           <div className="today-grid">
             <section className="today-section">
-              <div className="row between wrap today-section-head">
+              <div className="today-section-head">
                 <h3>
                   <Briefcase size={16} /> 3 work
                 </h3>
-                <label className="tiny today-mode screen-only">
-                  Pick
-                  <select
-                    value={plan.workMode}
-                    onChange={(e) =>
-                      updateToday({
-                        workMode: e.target.value as TodayPickMode,
-                        workSlots: emptyTodaySlots(),
-                      })
-                    }
-                  >
-                    <option value="tasks">Full tasks</option>
-                    <option value="subtasks">Subtasks</option>
-                  </select>
-                </label>
               </div>
-              {[0, 1, 2].map((i) =>
-                slotRow("workSlots", plan.workMode, workPool, workSubPool, i)
-              )}
+              {[0, 1, 2].map((i) => slotRow("workSlots", workPool, workSubPool, i))}
               <ol className="today-print-only">
                 {plan.workSlots.map((s, i) => (
                   <li key={i} className={s.done ? "print-struck" : ""}>
@@ -1669,29 +1808,12 @@ export default function App() {
               </ol>
             </section>
             <section className="today-section">
-              <div className="row between wrap today-section-head">
+              <div className="today-section-head">
                 <h3>
                   <Home size={16} /> 3 life
                 </h3>
-                <label className="tiny today-mode screen-only">
-                  Pick
-                  <select
-                    value={plan.lifeMode}
-                    onChange={(e) =>
-                      updateToday({
-                        lifeMode: e.target.value as TodayPickMode,
-                        lifeSlots: emptyTodaySlots(),
-                      })
-                    }
-                  >
-                    <option value="tasks">Full tasks</option>
-                    <option value="subtasks">Subtasks</option>
-                  </select>
-                </label>
               </div>
-              {[0, 1, 2].map((i) =>
-                slotRow("lifeSlots", plan.lifeMode, lifePool, lifeSubPool, i)
-              )}
+              {[0, 1, 2].map((i) => slotRow("lifeSlots", lifePool, lifeSubPool, i))}
               <ol className="today-print-only">
                 {plan.lifeSlots.map((s, i) => (
                   <li key={i} className={s.done ? "print-struck" : ""}>
@@ -1701,6 +1823,70 @@ export default function App() {
               </ol>
             </section>
           </div>
+
+          <section className="today-section today-simple-section">
+            <h3>Quick to-dos</h3>
+            <p className="muted tiny screen-only">
+              Today-only scratch list — add, check off, no scoring. Clears tomorrow. Copy anything
+              important onto Work/Life boards to keep it.
+            </p>
+            <div className="today-simple-add screen-only">
+              <input
+                value={todoDraft}
+                onChange={(e) => setTodoDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") addSimpleTodo();
+                }}
+                placeholder="Add a quick to-do… (Enter)"
+              />
+              <button className="tiny" onClick={addSimpleTodo} title="Add to-do">
+                <Plus size={14} /> Add
+              </button>
+            </div>
+            {plan.simpleTodos.length > 0 ? (
+              <ul className="today-simple-list">
+                {plan.simpleTodos.map((item) => (
+                  <li key={item.id} className={`today-simple-item ${item.done ? "done" : ""}`}>
+                    <button
+                      className="check screen-only"
+                      onClick={() => toggleSimpleTodo(item.id)}
+                      title={item.done ? "Mark not done" : "Mark done"}
+                    >
+                      {item.done ? <CheckSquare size={16} /> : <Square size={16} />}
+                    </button>
+                    <span className={`today-simple-title ${item.done ? "print-struck" : "screen-only"}`}>
+                      {item.done ? item.title : null}
+                    </span>
+                    {!item.done && (
+                      <CommitInput
+                        className="today-simple-title"
+                        value={item.title}
+                        onCommit={(txt) => updateSimpleTodoTitle(item.id, txt)}
+                      />
+                    )}
+                    <button
+                      className="icon screen-only"
+                      onClick={() => deleteSimpleTodo(item.id)}
+                      title="Remove"
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="muted tiny screen-only">No quick to-dos yet.</p>
+            )}
+            {plan.simpleTodos.length > 0 && (
+              <ul className="today-print-only">
+                {plan.simpleTodos.map((item) => (
+                  <li key={item.id} className={item.done ? "print-struck" : ""}>
+                    {item.done ? "☑" : "☐"} {item.title}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
         </div>
 
         <p className="muted tiny today-hint screen-only">
@@ -1708,6 +1894,20 @@ export default function App() {
           <kbd>2</kbd>
           <kbd>3</kbd> jump columns
         </p>
+
+        <section className="today-section today-quote-section screen-only">
+          <h3>Inspirational quote</h3>
+          <CommitTextarea
+            className="today-quote"
+            value={plan.inspirationalQuote}
+            onCommit={(txt) => updateToday({ inspirationalQuote: txt || DEFAULT_INSPIRATIONAL_QUOTE })}
+            rows={3}
+            placeholder="Set a quote for today…"
+          />
+        </section>
+        <blockquote className="today-print-only today-quote-print">
+          {plan.inspirationalQuote}
+        </blockquote>
       </div>
     );
   }
@@ -1816,7 +2016,7 @@ export default function App() {
           <div className="row gap flex1 min0">
             <button
               className="check"
-              onClick={() => updateTask(task.id, { completed: !task.completed })}
+              onClick={() => toggleTaskComplete(task.id)}
               title={task.completed ? "Mark incomplete" : "Mark complete"}
             >
               {task.completed ? <CheckSquare size={16} /> : <Square size={16} />}
@@ -2021,14 +2221,7 @@ export default function App() {
                           >
                             <button
                               className="check"
-                              onClick={() => {
-                                const arr = (task.children || []).map((x) =>
-                                  x.id === c.id
-                                    ? { ...x, completed: !x.completed, updatedAt: Date.now() }
-                                    : x
-                                );
-                                updateTask(task.id, { children: arr });
-                              }}
+                              onClick={() => toggleSubtaskComplete(task.id, c.id)}
                               title={c.completed ? "Mark incomplete" : "Mark complete"}
                             >
                               {c.completed ? <CheckSquare size={14} /> : <Square size={14} />}
@@ -2076,12 +2269,7 @@ export default function App() {
                 <input
                   type="checkbox"
                   checked={c.completed}
-                  onChange={() => {
-                    const arr = (task.children || []).map((x) =>
-                      x.id === c.id ? { ...x, completed: !x.completed, updatedAt: Date.now() } : x
-                    );
-                    updateTask(task.id, { children: arr });
-                  }}
+                  onChange={() => toggleSubtaskComplete(task.id, c.id)}
                 />
                 <span>{c.title}</span>
               </label>
@@ -2201,6 +2389,7 @@ export default function App() {
       owner: t.owner || "",
       blocked: blocked(t),
       iu: iuScore(t, state.weights),
+      defaultScores: hasDefaultScores(t),
     }));
     if (state.focus) {
       data = [...data].sort((a, b) => b.iu - a.iu).slice(0, 25);
@@ -2226,7 +2415,11 @@ export default function App() {
             const cx = x(d.urg),
               cy = y(d.imp);
             return (
-              <g key={d.id} onClick={() => setSelectedDot(d.id)} className={`dot ${sel ? "selected" : ""}`}>
+              <g
+                key={d.id}
+                onClick={() => setSelectedDot(d.id)}
+                className={`dot ${sel ? "selected" : ""} ${d.defaultScores ? "dot-default" : ""}`}
+              >
                 <circle cx={cx} cy={cy} r={r} />
                 <text x={cx + r + 3} y={cy + 3} className="dot-label">
                   {d.titleStub}
@@ -2440,11 +2633,6 @@ export default function App() {
       <div className={`app mode-${state.mode}`}>
         <style>{css}</style>
 
-        <div className="dev-banner" title="Cloud dev on port 5174">
-          Cloud dev · port 5174
-          {authOn ? " · Supabase auth on" : " · add .env.local for Supabase login"}
-        </div>
-
         <header className="header">
           <div className="left row gap">
             <button
@@ -2461,7 +2649,7 @@ export default function App() {
             </button>
             <img src="/parhelia-logo.png" alt="Parhelia Bio" className="brand-logo" />
             <div>
-              <h1>
+              <h1 className={state.section === "today" ? "spectrum-text" : ""}>
                 {state.section === "today"
                   ? "Today"
                   : state.section === "life"
@@ -2553,13 +2741,40 @@ export default function App() {
               <option value="dark">Dark</option>
               <option value="ocean">Ocean</option>
               <option value="forest">Forest</option>
+              <option value="rainbow">Rainbow</option>
             </select>
 
+            <button className="tiny" onClick={() => setHelpOpen(true)} title="How to use">
+              <HelpCircle size={14} /> ?
+            </button>
+
+            {authOn && !user && (
+              <button className="tiny" onClick={openAuth} title="Sign in (optional)">
+                <LogIn size={14} /> Sign in
+              </button>
+            )}
             {user && (
               <button className="tiny" onClick={() => void signOut()} title="Sign out">
                 <LogOut size={14} /> Sign out
               </button>
             )}
+            <button
+              className={`tiny ${state.celebrationsEnabled ? "active" : ""}`}
+              onClick={() =>
+                setStatePreserveScroll((s) => ({
+                  ...s,
+                  celebrationsEnabled: !s.celebrationsEnabled,
+                  celebrationPromptShown: true,
+                }))
+              }
+              title={
+                state.celebrationsEnabled
+                  ? "Celebrations on — click to disable"
+                  : "Celebrations off — click to enable"
+              }
+            >
+              🎉
+            </button>
             <button
               className="tiny"
               onClick={() => setStatePreserveScroll((s) => ({ ...s, showArchived: !s.showArchived }))}
@@ -2706,6 +2921,158 @@ export default function App() {
             How to think about ICE values →
           </a>
         </footer>
+
+        {celebrationOpen && (
+          <Celebration
+            key={celebrationTick}
+            variant={(celebrationTick - 1) % 3}
+            onFinish={() => setCelebrationOpen(false)}
+            onDisable={() => {
+              setStatePreserveScroll((s) => ({
+                ...s,
+                celebrationsEnabled: false,
+                celebrationPromptShown: true,
+              }));
+              setCelebrationOpen(false);
+            }}
+            showDisablePrompt={!state.celebrationPromptShown}
+            onDismissPrompt={() => {
+              setStatePreserveScroll((s) => ({ ...s, celebrationPromptShown: true }));
+              setCelebrationOpen(false);
+            }}
+          />
+        )}
+
+        {helpOpen && (
+          <div className="help-overlay" role="dialog" aria-modal="true">
+            <button className="help-backdrop" onClick={() => setHelpOpen(false)} aria-label="Close help" />
+            <div className="help-modal">
+              <div className="row between">
+                <div className="row gap">
+                  <HelpCircle size={16} />
+                  <strong>How to use</strong>
+                </div>
+                <button className="icon" onClick={() => setHelpOpen(false)} title="Close">
+                  <X size={16} />
+                </button>
+              </div>
+
+              <div className="help-body">
+                <p className="muted tiny help-intro">
+                  Prioritizer helps you plan today, score work with ICE, and keep Now / Next / Later
+                  boards for team and personal tasks.
+                </p>
+
+                <h4>Navigation</h4>
+                <ul className="help-list">
+                  <li>
+                    <strong>Today</strong> — 3·3·3 day planner (deep work + 3 work + 3 life).
+                  </li>
+                  <li>
+                    <strong>Work</strong> — team / project board with ICE scoring.
+                  </li>
+                  <li>
+                    <strong>Life</strong> — personal board, same tools, separate from work.
+                  </li>
+                  <li>
+                    Use <strong>search</strong> to filter by title, details, owner, tags, or subtasks.
+                  </li>
+                </ul>
+
+                <h4>Adding tasks</h4>
+                <ul className="help-list">
+                  <li>
+                    On Work or Life boards: click <strong>+</strong> in a column header, or type in{" "}
+                    <strong>Quick add</strong> and press Enter.
+                  </li>
+                  <li>
+                    Shortcut <strong>N</strong> adds a task to Now (when not typing in a field).
+                  </li>
+                  <li>
+                    <strong>/</strong> focuses search. <strong>1</strong> <strong>2</strong>{" "}
+                    <strong>3</strong> jump to Now / Next / Later columns.
+                  </li>
+                  <li>
+                    Switch to <strong>Edit</strong> mode to change titles, details, subtasks, due
+                    dates, and scores.
+                  </li>
+                </ul>
+
+                <h4>Scoring &amp; prioritizing (ICE)</h4>
+                <ul className="help-list">
+                  <li>
+                    Each task has <strong>I</strong>mpact, <strong>C</strong>onfidence,{" "}
+                    <strong>E</strong>ase, and <strong>U</strong>rgency (1–10). New tasks default to
+                    3.
+                  </li>
+                  <li>
+                    <strong>ICE</strong> ≈ I × C × E (weighted). <strong>IU</strong> = ICE × Urgency —
+                    shown on each card.
+                  </li>
+                  <li>
+                    Use <strong>Sort</strong>: Manual (drag order), ICE, Urgency, or ICE × Urgency to
+                    reorder columns.
+                  </li>
+                  <li>
+                    Adjust <strong>Weights</strong> in the toolbar if one dimension should matter more.
+                  </li>
+                  <li>
+                    <strong>Matrix</strong> and <strong>Scatter</strong> views plot importance vs
+                    urgency; <strong>Graph</strong> shows dependencies.
+                  </li>
+                  <li>
+                    <strong>Focus</strong> narrows each view to top-ranked items so you see less noise.
+                  </li>
+                </ul>
+
+                <h4>Board workflow</h4>
+                <ul className="help-list">
+                  <li>
+                    Drag tasks between <strong>Now</strong>, <strong>Next</strong>, and{" "}
+                    <strong>Later</strong>. Reordering within a column works in Manual sort only.
+                  </li>
+                  <li>
+                    Set <strong>WIP</strong> limits per column (0 = unlimited) to avoid overload.
+                  </li>
+                  <li>
+                    <strong>Hide done</strong> removes completed tasks from the board;{" "}
+                    <strong>Show archived</strong> toggles archived items.
+                  </li>
+                  <li>Archive or delete from the card actions. Restore from archive when shown.</li>
+                </ul>
+
+                <h4>Today page</h4>
+                <ul className="help-list">
+                  <li>
+                    Pick a <strong>main</strong> task or subtask for 3 hours of deep work; log time with
+                    +30m / +1h.
+                  </li>
+                  <li>
+                    Choose <strong>3 work</strong> and <strong>3 life</strong> items from your boards
+                    (tasks or subtasks in one list).
+                  </li>
+                  <li>
+                    <strong>Quick to-dos</strong> at the bottom are scratch items for today only — no
+                    scores, reset tomorrow.
+                  </li>
+                  <li>
+                    <strong>Download PDF</strong> exports your day plan. Done items stay crossed off
+                    until the next calendar day.
+                  </li>
+                </ul>
+
+                <h4>Other</h4>
+                <ul className="help-list">
+                  <li>
+                    <strong>Sign in</strong> is optional — saves your board per account when configured.
+                  </li>
+                  <li>Import / export CSV from the toolbar for backup or spreadsheets.</li>
+                  <li>Theme picker includes Rainbow and other color schemes.</li>
+                </ul>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </ErrorBoundary>
   );
@@ -2762,6 +3129,281 @@ const css = `
 
   --edge: #58735e; --lane: #1a2a1b;
 }
+/* Rainbow: full spectrum — primaries, secondaries, tertiaries + pink */
+:root[data-theme="rainbow"] {
+  /* Primary */
+  --rb-red: #ff2d55;
+  --rb-yellow: #ffe600;
+  --rb-blue: #2d9cff;
+  /* Secondary */
+  --rb-orange: #ff9500;
+  --rb-green: #34e07e;
+  --rb-violet: #9b5cff;
+  /* Tertiary */
+  --rb-red-orange: #ff6b2d;
+  --rb-yellow-orange: #ffb800;
+  --rb-yellow-green: #b8e62e;
+  --rb-blue-green: #2ee8d0;
+  --rb-blue-violet: #6b7aff;
+  --rb-red-violet: #d94dff;
+  /* Extra pink */
+  --rb-pink: #ff5ebf;
+  --rb-hot-pink: #ff3dad;
+  --rb-blush: #ff9ed8;
+
+  --bg: #100828;
+  --bg-elev: #1a1042;
+  --text: #fffafd;
+  --muted: #f5dfff;
+  --card: #22124f;
+  --border: #ff5ebf;
+  --accent: #ff3dad;
+  --accent-weak: #ff3dad30;
+  --danger: #ff4466;
+  --warn: #ffc400;
+  --ok: #34e07e;
+
+  --heat-imp: #34e07e;
+  --heat-imp-weak: #34e07e40;
+  --heat-urg: #ff4466;
+  --heat-urg-weak: #ff446640;
+  --heat-iu: #b87aff;
+  --heat-iu-weak: #b87aff40;
+
+  --edge: #9b5cff;
+  --lane: #3d2080;
+}
+
+html[data-theme="rainbow"] body {
+  background:
+    radial-gradient(ellipse 80% 50% at 10% 0%, rgba(255, 45, 85, 0.22), transparent 55%),
+    radial-gradient(ellipse 70% 45% at 90% 8%, rgba(45, 156, 255, 0.2), transparent 50%),
+    radial-gradient(ellipse 60% 40% at 50% 100%, rgba(255, 62, 173, 0.18), transparent 55%),
+    radial-gradient(ellipse 50% 35% at 20% 60%, rgba(255, 230, 0, 0.1), transparent 45%),
+    radial-gradient(ellipse 45% 30% at 80% 70%, rgba(52, 224, 126, 0.12), transparent 45%),
+    linear-gradient(165deg, #0c0620 0%, #140a32 35%, #1a1048 65%, #280e38 100%);
+  background-attachment: fixed;
+}
+
+:root[data-theme="rainbow"] .app {
+  position: relative;
+}
+
+:root[data-theme="rainbow"] h1:not(.spectrum-text) {
+  background: linear-gradient(
+    95deg,
+    var(--rb-hot-pink) 0%,
+    var(--rb-red) 12%,
+    var(--rb-orange) 28%,
+    var(--rb-yellow) 42%,
+    var(--rb-green) 58%,
+    var(--rb-blue) 72%,
+    var(--rb-violet) 88%,
+    var(--rb-pink) 100%
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.spectrum-text {
+  background: linear-gradient(
+    90deg,
+    #ff0000 0%,
+    #ff7f00 16%,
+    #ffff00 32%,
+    #00ff00 48%,
+    #0000ff 64%,
+    #4b0082 80%,
+    #8f00ff 96%
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+:root[data-theme="rainbow"] .spectrum-text {
+  background-size: 200% 100%;
+  animation: spectrum-shift 6s linear infinite;
+}
+@keyframes spectrum-shift {
+  0% { background-position: 0% 50%; }
+  100% { background-position: 200% 50%; }
+}
+
+
+:root[data-theme="rainbow"] .profile-avatar {
+  border: 2px solid transparent;
+  background:
+    linear-gradient(var(--bg-elev), var(--bg-elev)) padding-box,
+    linear-gradient(
+      135deg,
+      var(--rb-red),
+      var(--rb-orange),
+      var(--rb-yellow),
+      var(--rb-green),
+      var(--rb-blue-green),
+      var(--rb-blue),
+      var(--rb-violet),
+      var(--rb-pink)
+    ) border-box;
+}
+
+:root[data-theme="rainbow"] .search {
+  border: 2px solid transparent;
+  background:
+    linear-gradient(var(--bg-elev), var(--bg-elev)) padding-box,
+    linear-gradient(90deg, var(--rb-pink), var(--rb-yellow), var(--rb-blue-green), var(--rb-violet)) border-box;
+}
+
+:root[data-theme="rainbow"] .section-nav .tiny:nth-child(1).active {
+  border-color: var(--rb-hot-pink);
+  background: rgba(255, 61, 173, 0.28);
+  color: #fff;
+  box-shadow: 0 0 12px rgba(255, 94, 191, 0.45);
+}
+:root[data-theme="rainbow"] .section-nav .tiny:nth-child(2).active {
+  border-color: var(--rb-blue);
+  background: rgba(45, 156, 255, 0.25);
+  color: #fff;
+  box-shadow: 0 0 12px rgba(45, 156, 255, 0.4);
+}
+:root[data-theme="rainbow"] .section-nav .tiny:nth-child(3).active {
+  border-color: var(--rb-green);
+  background: rgba(52, 224, 126, 0.22);
+  color: #fff;
+  box-shadow: 0 0 12px rgba(52, 224, 126, 0.35);
+}
+
+:root[data-theme="rainbow"] .board .columns .column:nth-child(1) {
+  border-color: var(--rb-red);
+  box-shadow: 0 0 0 1px rgba(255, 45, 85, 0.35) inset, 0 4px 20px rgba(255, 45, 85, 0.12);
+}
+:root[data-theme="rainbow"] .board .columns .column:nth-child(2) {
+  border-color: var(--rb-yellow-orange);
+  box-shadow: 0 0 0 1px rgba(255, 184, 0, 0.35) inset, 0 4px 20px rgba(255, 149, 0, 0.12);
+}
+:root[data-theme="rainbow"] .board .columns .column:nth-child(3) {
+  border-color: var(--rb-blue-violet);
+  box-shadow: 0 0 0 1px rgba(107, 122, 255, 0.35) inset, 0 4px 20px rgba(45, 156, 255, 0.12);
+}
+
+:root[data-theme="rainbow"] .board .columns .column:nth-child(1) .col-header .pill {
+  color: var(--rb-red);
+  border-color: var(--rb-red);
+  background: rgba(255, 45, 85, 0.15);
+}
+:root[data-theme="rainbow"] .board .columns .column:nth-child(2) .col-header .pill {
+  color: var(--rb-orange);
+  border-color: var(--rb-orange);
+  background: rgba(255, 149, 0, 0.15);
+}
+:root[data-theme="rainbow"] .board .columns .column:nth-child(3) .col-header .pill {
+  color: var(--rb-blue);
+  border-color: var(--rb-blue);
+  background: rgba(45, 156, 255, 0.15);
+}
+
+:root[data-theme="rainbow"] .card {
+  border-color: rgba(255, 94, 191, 0.35);
+  background: linear-gradient(145deg, rgba(34, 18, 79, 0.95), rgba(40, 22, 90, 0.88));
+}
+:root[data-theme="rainbow"] .card:hover {
+  border-color: var(--rb-pink);
+}
+
+:root[data-theme="rainbow"] .tiny.active {
+  border-color: var(--rb-hot-pink);
+  background: rgba(255, 61, 173, 0.22);
+  box-shadow: 0 0 10px rgba(255, 94, 191, 0.35);
+}
+
+:root[data-theme="rainbow"] .tiny:hover {
+  border-color: var(--rb-blush);
+}
+
+:root[data-theme="rainbow"] a,
+:root[data-theme="rainbow"] .learn-link {
+  color: var(--rb-blue-green);
+}
+:root[data-theme="rainbow"] a:hover {
+  color: var(--rb-pink);
+}
+
+:root[data-theme="rainbow"] .today-main-block {
+  border: 2px solid var(--rb-hot-pink);
+  box-shadow:
+    0 0 0 2px rgba(255, 61, 173, 0.2),
+    0 0 28px rgba(255, 149, 0, 0.15),
+    0 0 40px rgba(45, 156, 255, 0.1);
+  background: linear-gradient(135deg, rgba(255, 61, 173, 0.08), rgba(45, 156, 255, 0.06));
+}
+
+:root[data-theme="rainbow"] .today-section {
+  border-color: rgba(155, 92, 255, 0.45);
+  background: linear-gradient(160deg, rgba(34, 18, 79, 0.9), rgba(26, 16, 66, 0.85));
+}
+
+:root[data-theme="rainbow"] .today-grid .today-section:first-child {
+  border-color: var(--rb-blue);
+  box-shadow: 0 0 16px rgba(45, 156, 255, 0.12);
+}
+:root[data-theme="rainbow"] .today-grid .today-section:last-child {
+  border-color: var(--rb-green);
+  box-shadow: 0 0 16px rgba(52, 224, 126, 0.12);
+}
+
+:root[data-theme="rainbow"] .today-quote-section {
+  border: 2px dashed var(--rb-violet);
+  background: linear-gradient(120deg, rgba(217, 77, 255, 0.08), rgba(255, 94, 191, 0.1));
+}
+
+:root[data-theme="rainbow"] .ice-help {
+  border: 2px solid transparent;
+  background:
+    linear-gradient(var(--bg-elev), var(--bg-elev)) padding-box,
+    linear-gradient(
+      120deg,
+      var(--rb-green),
+      var(--rb-yellow-green),
+      var(--rb-blue-green),
+      var(--rb-blue),
+      var(--rb-violet),
+      var(--rb-pink)
+    ) border-box;
+}
+
+:root[data-theme="rainbow"] .weights,
+:root[data-theme="rainbow"] .wips {
+  border-color: var(--rb-blue-violet);
+  background: rgba(26, 16, 66, 0.85);
+}
+
+:root[data-theme="rainbow"] .hours-fill {
+  background: linear-gradient(90deg, var(--rb-pink), var(--rb-orange), var(--rb-yellow), var(--rb-green));
+}
+
+:root[data-theme="rainbow"] input[type="range"] {
+  accent-color: var(--rb-hot-pink);
+}
+
+:root[data-theme="rainbow"] .scatter svg {
+  border: 2px solid transparent;
+  background:
+    linear-gradient(var(--bg-elev), var(--bg-elev)) padding-box,
+    linear-gradient(135deg, var(--rb-red-orange), var(--rb-yellow), var(--rb-blue-green), var(--rb-violet), var(--rb-pink)) border-box;
+}
+
+:root[data-theme="rainbow"] .dot circle {
+  fill: var(--rb-hot-pink);
+}
+:root[data-theme="rainbow"] .dot.dot-default circle {
+  fill: color-mix(in srgb, var(--rb-violet) 40%, #9ca3af);
+}
+
+:root[data-theme="rainbow"] .matrix .grid-2 > div:nth-child(1) { border-color: var(--rb-green); }
+:root[data-theme="rainbow"] .matrix .grid-2 > div:nth-child(2) { border-color: var(--rb-yellow-green); }
+:root[data-theme="rainbow"] .matrix .grid-2 > div:nth-child(3) { border-color: var(--rb-orange); }
+:root[data-theme="rainbow"] .matrix .grid-2 > div:nth-child(4) { border-color: var(--rb-red-violet); }
 
 * { box-sizing: border-box; }
 html, body, #root { height: 100%; }
@@ -2771,16 +3413,6 @@ button, input, select, textarea { font: inherit; color: inherit; background: tra
 a { color: var(--accent); text-decoration: none; }
 
 .app { width: 100%; max-width: 100%; margin: 0 auto; padding: 12px 16px; }
-.dev-banner {
-  text-align: center;
-  font-size: 11px;
-  padding: 6px 10px;
-  margin-bottom: 8px;
-  border-radius: 8px;
-  border: 1px dashed var(--accent);
-  background: var(--accent-weak);
-  color: var(--muted);
-}
 
 .header { display: grid; grid-template-columns: 1fr 2fr 1fr; gap: 12px; align-items: center; margin-bottom: 8px; }
 .left { display: flex; align-items: center; gap: 8px; }
@@ -2916,6 +3548,7 @@ svg .muted { fill: var(--muted); }
 .axis { stroke: var(--border); stroke-width: 1; }
 .cross { stroke: var(--accent); stroke-width: 1; stroke-dasharray: 4 3; }
 .dot circle { fill: var(--accent); opacity: 0.9; }
+.dot.dot-default circle { fill: color-mix(in srgb, var(--accent) 50%, #9ca3af); opacity: 0.75; }
 .dot.selected circle { stroke: var(--text); stroke-width: 1; }
 .dot-label { font-size: 9px; fill: var(--muted); pointer-events: none; }
 .tri { fill: var(--danger); }
@@ -2955,10 +3588,23 @@ svg .muted { fill: var(--muted); }
 .today-hint kbd { font: inherit; font-size: 10px; padding: 1px 5px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-elev); }
 .today-slot.done .today-slot-done-label { text-decoration: line-through; opacity: 0.75; color: var(--muted); }
 .today-slot-done-label { flex: 1; min-width: 0; padding: 8px 0; }
-.today-section-head { margin-bottom: 4px; align-items: center; }
-.today-mode { display: inline-flex; align-items: center; gap: 6px; }
-.today-mode select { padding: 4px 8px; border-radius: 8px; border: 1px solid var(--border); background: var(--card); }
+.today-section-head { margin-bottom: 4px; align-items: center; gap: 12px; }
+.today-mode-row { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.today-mode-label { font-size: 11px; white-space: nowrap; }
+.today-mode-select { padding: 4px 8px; border-radius: 8px; border: 1px solid var(--border); background: var(--card); font-size: 11px; min-width: 108px; }
 .today-header { align-items: flex-start; margin-bottom: 4px; }
+.today-quote { width: 100%; margin-top: 6px; padding: 10px; border: 1px solid var(--border); border-radius: 8px; background: transparent; resize: vertical; font-style: italic; line-height: 1.5; }
+.today-quote-section { border-style: dashed; }
+.today-quote-print { margin-top: 16px; font-style: italic; font-size: 14px; line-height: 1.5; padding: 12px; border-top: 1px solid #ccc; }
+
+.today-simple-section { margin-top: 4px; }
+.today-simple-add { display: flex; gap: 8px; margin-top: 8px; }
+.today-simple-add input { flex: 1; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--card); }
+.today-simple-list { list-style: none; margin: 10px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.today-simple-item { display: grid; grid-template-columns: auto 1fr auto; gap: 8px; align-items: center; }
+.today-simple-item.done .today-simple-title { color: var(--muted); }
+.today-simple-title { width: 100%; border: none; background: transparent; padding: 4px 0; }
+.today-simple-title:focus { outline: none; border-bottom: 1px solid var(--border); }
 
 .ice-help {
   margin: 0 0 12px;
@@ -2977,8 +3623,17 @@ svg .muted { fill: var(--muted); }
 .screen-only { display: block; }
 .print-struck { text-decoration: line-through; }
 
+.help-overlay { position: fixed; inset: 0; z-index: 2100; display: grid; place-items: center; }
+.help-backdrop { position: fixed; inset: 0; background: rgba(8, 10, 24, 0.55); backdrop-filter: blur(3px); border: none; }
+.help-modal { width: min(760px, calc(100vw - 24px)); max-height: min(82vh, 760px); overflow: auto; background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 14px; box-shadow: 0 30px 90px rgba(0,0,0,0.45); position: relative; }
+.help-body { margin-top: 10px; display: flex; flex-direction: column; gap: 10px; }
+.help-intro { margin: 0 0 4px; line-height: 1.5; }
+.help-body h4 { margin: 0; font-size: 13px; }
+.help-list { margin: 0; padding-left: 18px; color: var(--muted); }
+.help-list li { margin: 6px 0; }
+
 @media print {
-  .dev-banner, .header, .toolbar, .learn-footer, .today-hint, .screen-only, .ice-help { display: none !important; }
+  .header, .toolbar, .learn-footer, .today-hint, .screen-only, .ice-help { display: none !important; }
   .today-print-only { display: block !important; }
   .today-print-sheet { max-width: 100%; }
   .today-page { max-width: 100%; padding: 0; }
