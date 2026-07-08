@@ -2832,7 +2832,7 @@ export default function App() {
             </button>
             <img src="/parhelia-logo.png" alt="Parhelia Bio" className="brand-logo" />
             <div>
-              <h1 className={state.section === "today" ? "spectrum-text" : ""}>
+              <h1 className={state.section === "today" ? "today-brand" : ""}>
                 {state.section === "today"
                   ? "Today"
                   : state.section === "life"
@@ -3372,6 +3372,12 @@ const css = `
   --lane: #3d2080;
 }
 
+/* Rainbow theme: keep Graph view less pink */
+:root[data-theme="rainbow"] .graph {
+  --edge: #6b7aff;
+  --lane: #2a2f55;
+}
+
 html[data-theme="rainbow"] body {
   background:
     radial-gradient(ellipse 80% 50% at 10% 0%, rgba(255, 45, 85, 0.22), transparent 55%),
@@ -3666,6 +3672,9 @@ a { color: var(--accent); text-decoration: none; }
 .top-focus:not(.active) { background: color-mix(in srgb, var(--bg-elev) 55%, transparent); }
 
 .top-label { white-space: nowrap; }
+
+.today-brand { color: #2d9cff; }
+:root[data-theme="dark"] .today-brand { color: #27b0ff; }
 
 .logo { width: 36px; height: 36px; border-radius: 50%; overflow: hidden; background: var(--border); display:flex; align-items:center; justify-content:center; }
 .logo img { width: 100%; height: 100%; object-fit: cover; }
