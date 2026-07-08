@@ -163,6 +163,83 @@ function uid(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function nowDateTimeLabel() {
+  return new Date().toLocaleString(undefined, {
+    weekday: "long",
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+async function downloadElementPdf(node: HTMLElement | null, filename: string) {
+  if (!node) {
+    alert("Nothing to export yet — try again in a moment.");
+    return;
+  }
+  try {
+    const canvas = await html2canvas(node, {
+      backgroundColor: "#ffffff",
+      scale: 2,
+      useCORS: true,
+      logging: false,
+      onclone: (doc, cloned) => {
+        const sheet = cloned as HTMLElement;
+        if (
+          sheet.classList.contains("board-print-sheet") ||
+          sheet.classList.contains("today-print-sheet")
+        ) {
+          sheet.style.position = "relative";
+          sheet.style.left = "0";
+          sheet.style.top = "0";
+          sheet.style.opacity = "1";
+          sheet.style.zIndex = "1";
+        }
+        doc.querySelectorAll(".today-print-only").forEach((el) => {
+          (el as HTMLElement).style.display = "block";
+        });
+        doc.querySelectorAll(".screen-only").forEach((el) => {
+          (el as HTMLElement).style.display = "none";
+        });
+      },
+    });
+    const imgData = canvas.toDataURL("image/png");
+    const pdf = new jsPDF({ orientation: "p", unit: "pt", format: "letter" });
+    const pageWidth = pdf.internal.pageSize.getWidth();
+    const pageHeight = pdf.internal.pageSize.getHeight();
+    const imgWidth = pageWidth;
+    const imgHeight = (canvas.height * imgWidth) / canvas.width;
+    let y = 0;
+    let remaining = imgHeight;
+    while (remaining > 0) {
+      pdf.addImage(imgData, "PNG", 0, y, imgWidth, imgHeight);
+      remaining -= pageHeight;
+      if (remaining > 0) {
+        pdf.addPage();
+        y -= pageHeight;
+      }
+    }
+    pdf.save(filename);
+  } catch (err) {
+    console.error("PDF export failed", err);
+    alert("Could not create PDF. Try refreshing the page and exporting again.");
+  }
+}
+
+function downloadTextFile(filename: string, content: string) {
+  const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 function buildAppState(persisted: Partial<AppState> | null): AppState {
   const theme = (persisted?.theme as Theme) || "ocean";
   const rawTasks = Array.isArray(persisted?.tasks)
@@ -1461,6 +1538,46 @@ export default function App() {
   };
 
   const todayPrintRef = useRef<HTMLDivElement>(null);
+  const boardPrintRef = useRef<HTMLDivElement>(null);
+
+  const downloadBoardPdf = () => {
+    const label = state.section === "life" ? "life" : "work";
+    void downloadElementPdf(boardPrintRef.current, `${label}-board-${todayDateKey()}.pdf`);
+  };
+
+  const downloadBoardTxt = () => {
+    const label = state.section === "life" ? "life" : "work";
+    const title = state.section === "life" ? "Life" : "Work";
+    const lines: string[] = [];
+    lines.push(`${title} — Now / Next / Later`);
+    lines.push(`Date: ${nowDateTimeLabel()}`);
+    lines.push(
+      `Focus: ${state.focus ? "on" : "off"} | Hide done: ${state.showCompleted ? "off" : "on"} | Search: ${
+        state.search || "—"
+      }`
+    );
+    lines.push("");
+    for (const s of statuses) {
+      const list = filteredByStatus(s);
+      lines.push(`${s.toUpperCase()}:`);
+      if (list.length === 0) {
+        lines.push("- (none)");
+      } else {
+        for (const t of list) {
+          const ICE = round2(importanceICE(t, state.weights));
+          const URG = round2(urgencyW(t, state.weights));
+          const IU = round2(iuScore(t, state.weights));
+          lines.push(`- ${t.completed ? "[x]" : "[ ]"} ${t.title} (ICE ${ICE}, URG ${URG}, IU ${IU})`);
+          const subs = (t.children || []).slice().sort((a, b) => a.order - b.order);
+          for (const c of subs) {
+            lines.push(`  - ${c.completed ? "[x]" : "[ ]"} ${c.title}`);
+          }
+        }
+      }
+      lines.push("");
+    }
+    downloadTextFile(`${label}-board-${todayDateKey()}.txt`, lines.join("\n").trimEnd() + "\n");
+  };
 
   function IceHelpPanel() {
     return (
@@ -1539,6 +1656,64 @@ export default function App() {
     </>
   );
 
+  function BoardPrintSheet() {
+    const boardLabel = state.section === "life" ? "Life" : "Work";
+    const printDate = nowDateTimeLabel();
+    const w = state.weights;
+
+    return (
+      <div ref={boardPrintRef} className="board-print-sheet" aria-hidden="true">
+        <h1>
+          {boardLabel} — Now / Next / Later
+        </h1>
+        <p className="board-print-meta">{printDate}</p>
+        {state.focus && <p className="board-print-meta">Focus: top 2 per column</p>}
+        <p className="board-print-meta">
+          Sort: {state.sortBy} · View: {state.view}
+        </p>
+        <div className="board-print-grid">
+          {statuses.map((s) => {
+            const list = filteredByStatus(s);
+            return (
+              <section key={s} className="board-print-col">
+                <h2>{s.toUpperCase()}</h2>
+                {list.length === 0 ? (
+                  <p className="board-print-empty">—</p>
+                ) : (
+                  <ul>
+                    {list.map((t) => {
+                      const ICE = round2(importanceICE(t, w));
+                      const URG = round2(urgencyW(t, w));
+                      const IU = round2(iuScore(t, w));
+                      const subs = (t.children || []).slice().sort((a, b) => a.order - b.order);
+                      return (
+                        <li key={t.id} className={t.completed ? "print-struck" : ""}>
+                          <strong>{t.title}</strong>
+                          <span className="board-print-scores">
+                            ICE {ICE} · URG {URG} · IU {IU}
+                          </span>
+                          {subs.length > 0 && (
+                            <ul className="board-print-subs">
+                              {subs.map((c) => (
+                                <li key={c.id} className={c.completed ? "print-struck" : ""}>
+                                  {c.title}
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
+              </section>
+            );
+          })}
+        </div>
+      </div>
+    );
+  }
+
   function TodayView() {
     const plan = state.today;
     const [todoDraft, setTodoDraft] = useState("");
@@ -1559,38 +1734,44 @@ export default function App() {
       ].filter(Boolean) as string[]
     );
 
-    const downloadTodayPdf = async () => {
-      const node = todayPrintRef.current;
-      if (!node) return;
+    const downloadTodayPdf = () => {
+      void downloadElementPdf(todayPrintRef.current, `today-${todayDateKey()}.pdf`);
+    };
 
-      // Render at higher scale for legibility in PDF.
-      const canvas = await html2canvas(node, {
-        backgroundColor: "#ffffff",
-        scale: 2,
-        useCORS: true,
+    const downloadTodayTxt = () => {
+      const lines: string[] = [];
+      lines.push("Today — 3·3·3");
+      lines.push(`Date: ${nowDateTimeLabel()}`);
+      lines.push("");
+      lines.push("Deep work (3h):");
+      lines.push(
+        `- ${plan.mainRef ? (mainDone ? "[x]" : "[ ]") : "[ ]"} ${
+          plan.mainRef ? mainLabel : "(not set)"
+        } (${plan.mainHoursLogged.toFixed(1)} / 3 h)`
+      );
+      lines.push("");
+      lines.push("3 work:");
+      plan.workSlots.forEach((s) => {
+        lines.push(`- ${s.ref ? (s.done ? "[x]" : "[ ]") : "[ ]"} ${s.ref ? slotLabel(s.ref) : "(empty slot)"}`);
       });
-      const imgData = canvas.toDataURL("image/png");
-
-      const pdf = new jsPDF({ orientation: "p", unit: "pt", format: "letter" });
-      const pageWidth = pdf.internal.pageSize.getWidth();
-      const pageHeight = pdf.internal.pageSize.getHeight();
-
-      const imgWidth = pageWidth;
-      const imgHeight = (canvas.height * imgWidth) / canvas.width;
-
-      let y = 0;
-      let remaining = imgHeight;
-      while (remaining > 0) {
-        pdf.addImage(imgData, "PNG", 0, y, imgWidth, imgHeight);
-        remaining -= pageHeight;
-        if (remaining > 0) {
-          pdf.addPage();
-          y -= pageHeight;
+      lines.push("");
+      lines.push("3 life:");
+      plan.lifeSlots.forEach((s) => {
+        lines.push(`- ${s.ref ? (s.done ? "[x]" : "[ ]") : "[ ]"} ${s.ref ? slotLabel(s.ref) : "(empty slot)"}`);
+      });
+      lines.push("");
+      lines.push("Quick to-dos:");
+      if (plan.simpleTodos.length === 0) lines.push("- (none)");
+      else {
+        for (const item of plan.simpleTodos) {
+          lines.push(`- ${item.done ? "[x]" : "[ ]"} ${item.title}`);
         }
       }
-
-      const name = `today-${todayDateKey()}.pdf`;
-      pdf.save(name);
+      lines.push("");
+      lines.push("Quote:");
+      lines.push(plan.inspirationalQuote?.trim() ? plan.inspirationalQuote.trim() : DEFAULT_INSPIRATIONAL_QUOTE);
+      lines.push("");
+      downloadTextFile(`today-${todayDateKey()}.txt`, lines.join("\n").trimEnd() + "\n");
     };
 
     const addSimpleTodo = () => {
@@ -1682,25 +1863,25 @@ export default function App() {
       );
     };
 
-    const printDate = new Date().toLocaleDateString(undefined, {
-      weekday: "long",
-      year: "numeric",
-      month: "long",
-      day: "numeric",
-    });
+    const printDate = nowDateTimeLabel();
 
     return (
       <div className="today-page">
         <div className="today-header row between wrap">
           <div>
-            <h2 className="spectrum-text">Today — 3·3·3</h2>
+            <h2 className={state.theme === "rainbow" ? "spectrum-text" : ""}>Today — 3·3·3</h2>
             <p className="muted tiny">
               3 hours on your main task · 3 work · 3 life · Completed items stay crossed off until tomorrow
             </p>
           </div>
-          <button className="tiny" onClick={() => void downloadTodayPdf()} title="Download a PDF">
-            <Printer size={14} /> Download PDF
-          </button>
+          <div className="row gap">
+            <button className="tiny" onClick={() => void downloadTodayPdf()} title="Download a PDF">
+              <Printer size={14} /> PDF
+            </button>
+            <button className="tiny" onClick={downloadTodayTxt} title="Download a plain-text list (email-friendly)">
+              <Download size={14} /> TXT
+            </button>
+          </div>
         </div>
 
         <div ref={todayPrintRef} className="today-print-sheet">
@@ -1889,20 +2070,16 @@ export default function App() {
           </section>
         </div>
 
-        <p className="muted tiny today-hint screen-only">
-          Shortcuts on boards: <kbd>N</kbd> new task · <kbd>/</kbd> search · <kbd>1</kbd>
-          <kbd>2</kbd>
-          <kbd>3</kbd> jump columns
-        </p>
-
         <section className="today-section today-quote-section screen-only">
           <h3>Inspirational quote</h3>
           <CommitTextarea
-            className="today-quote"
+            className={`today-quote ${
+              plan.inspirationalQuote?.trim() === DEFAULT_INSPIRATIONAL_QUOTE ? "is-default" : ""
+            }`}
             value={plan.inspirationalQuote}
             onCommit={(txt) => updateToday({ inspirationalQuote: txt || DEFAULT_INSPIRATIONAL_QUOTE })}
             rows={3}
-            placeholder="Set a quote for today…"
+            placeholder='Paste a quote for today… e.g. "Do the next right thing."'
           />
         </section>
         <blockquote className="today-print-only today-quote-print">
@@ -2008,10 +2185,112 @@ export default function App() {
     const IU = ICE * URG;
     const short = { impact: "I", confidence: "C", ease: "E", urgency: "U" } as const;
     const due = dueBadge(task.due);
+    const subs = (task.children || []).slice().sort((a, b) => a.order - b.order);
+    const focusBoardSubs = state.focus && state.view === "board" && subs.length > 0;
+    const subsDone = subs.filter((c) => c.completed).length;
+
+    const subtasksSection = focusBoardSubs ? (
+      <details className="subtasks-focus-dropdown">
+        <summary>
+          Subtasks ({subsDone}/{subs.length})
+        </summary>
+        <div className="subtasks-focus-list">
+          {subs.map((c) => (
+            <label key={c.id} className={`subtasks-focus-item ${c.completed ? "done" : ""}`}>
+              <input
+                type="checkbox"
+                checked={c.completed}
+                onChange={() => toggleSubtaskComplete(task.id, c.id)}
+              />
+              <span>{c.title}</span>
+            </label>
+          ))}
+        </div>
+      </details>
+    ) : isEdit ? (
+      <div className="list-section">
+        <div className="row between">
+          <strong>Subtasks</strong>
+          <button className="tiny" onClick={() => addSubtask(task.id)}>
+            <Plus size={14} /> Add
+          </button>
+        </div>
+        <Droppable
+          droppableId={`subtasks-${task.id}`}
+          type="SUBTASK"
+          isDropDisabled={state.sortBy !== "manual"}
+        >
+          {(provided) => (
+            <div ref={provided.innerRef} {...provided.droppableProps} className="subtasks">
+              {subs.map((c, i) => (
+                <Draggable
+                  key={c.id}
+                  draggableId={`subtask-${c.id}`}
+                  index={i}
+                  isDragDisabled={state.sortBy !== "manual"}
+                >
+                  {(prov) => (
+                    <div
+                      ref={prov.innerRef}
+                      {...prov.draggableProps}
+                      {...prov.dragHandleProps}
+                      className="subtask"
+                    >
+                      <button
+                        className="check"
+                        onClick={() => toggleSubtaskComplete(task.id, c.id)}
+                        title={c.completed ? "Mark incomplete" : "Mark complete"}
+                      >
+                        {c.completed ? <CheckSquare size={14} /> : <Square size={14} />}
+                      </button>
+                      <CommitInput
+                        className="subtask-title"
+                        value={c.title}
+                        onCommit={(txt) => {
+                          const arr = (task.children || []).map((x) =>
+                            x.id === c.id ? { ...x, title: txt, updatedAt: Date.now() } : x
+                          );
+                          updateTask(task.id, { children: arr });
+                        }}
+                      />
+                      <button
+                        className="icon"
+                        onClick={() =>
+                          updateTask(task.id, {
+                            children: (task.children || []).filter((x) => x.id !== c.id),
+                          })
+                        }
+                        title="Remove"
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
+                  )}
+                </Draggable>
+              ))}
+              {provided.placeholder}
+            </div>
+          )}
+        </Droppable>
+      </div>
+    ) : subs.length > 0 ? (
+      <div className="overview-subtasks">
+        {subs.slice(0, 6).map((c) => (
+          <label key={c.id} className={`os-item ${c.completed ? "done" : ""}`}>
+            <input
+              type="checkbox"
+              checked={c.completed}
+              onChange={() => toggleSubtaskComplete(task.id, c.id)}
+            />
+            <span>{c.title}</span>
+          </label>
+        ))}
+        {subs.length > 6 && <span className="muted tiny">+{subs.length - 6} more…</span>}
+      </div>
+    ) : null;
 
     return (
       <div>
-        {/* Title row */}
         <div className="row between wrap">
           <div className="row gap flex1 min0">
             <button
@@ -2044,7 +2323,6 @@ export default function App() {
           </div>
         </div>
 
-        {/* Metrics row */}
         <div className="row gap metrics-row" title="Fill = value ÷ max among currently visible tasks">
           {task.archived && <span className="badge">Archived</span>}
           {blocked(task) && (
@@ -2052,9 +2330,7 @@ export default function App() {
               <AlertTriangle size={14} /> Blocked
             </span>
           )}
-          {due && (
-            <span className={`badge due-${due.tone}`}>{due.label}</span>
-          )}
+          {due && <span className={`badge due-${due.tone}`}>{due.label}</span>}
           <span className="pill metric" style={heatICE(ICE)}>
             ICE {round2(ICE)}
           </span>
@@ -2066,7 +2342,6 @@ export default function App() {
           </span>
         </div>
 
-        {/* Edit-only fields */}
         {isEdit ? (
           <>
             <CommitTextarea
@@ -2186,99 +2461,7 @@ export default function App() {
           </>
         ) : null}
 
-        {/* Subtasks */}
-        {isEdit ? (
-          <div className="list-section">
-            <div className="row between">
-              <strong>Subtasks</strong>
-              <button className="tiny" onClick={() => addSubtask(task.id)}>
-                <Plus size={14} /> Add
-              </button>
-            </div>
-            <Droppable
-              droppableId={`subtasks-${task.id}`}
-              type="SUBTASK"
-              isDropDisabled={state.sortBy !== "manual"}
-            >
-              {(provided) => (
-                <div ref={provided.innerRef} {...provided.droppableProps} className="subtasks">
-                  {(task.children || [])
-                    .slice()
-                    .sort((a, b) => a.order - b.order)
-                    .map((c, i) => (
-                      <Draggable
-                        key={c.id}
-                        draggableId={`subtask-${c.id}`}
-                        index={i}
-                        isDragDisabled={state.sortBy !== "manual"}
-                      >
-                        {(prov) => (
-                          <div
-                            ref={prov.innerRef}
-                            {...prov.draggableProps}
-                            {...prov.dragHandleProps}
-                            className="subtask"
-                          >
-                            <button
-                              className="check"
-                              onClick={() => toggleSubtaskComplete(task.id, c.id)}
-                              title={c.completed ? "Mark incomplete" : "Mark complete"}
-                            >
-                              {c.completed ? <CheckSquare size={14} /> : <Square size={14} />}
-                            </button>
-                            <CommitInput
-                              className="subtask-title"
-                              value={c.title}
-                              onCommit={(txt) => {
-                                const arr = (task.children || []).map((x) =>
-                                  x.id === c.id
-                                    ? {
-                                        ...x,
-                                        title: txt,
-                                        updatedAt: Date.now(),
-                                      }
-                                    : x
-                                );
-                                updateTask(task.id, { children: arr });
-                              }}
-                            />
-                            <button
-                              className="icon"
-                              onClick={() =>
-                                updateTask(task.id, {
-                                  children: (task.children || []).filter((x) => x.id !== c.id),
-                                })
-                              }
-                              title="Remove"
-                            >
-                              <Trash2 size={14} />
-                            </button>
-                          </div>
-                        )}
-                      </Draggable>
-                    ))}
-                  {provided.placeholder}
-                </div>
-              )}
-            </Droppable>
-          </div>
-        ) : (task.children?.length ?? 0) > 0 ? (
-          <div className="overview-subtasks">
-            {(task.children || []).slice(0, 6).map((c) => (
-              <label key={c.id} className={`os-item ${c.completed ? "done" : ""}`}>
-                <input
-                  type="checkbox"
-                  checked={c.completed}
-                  onChange={() => toggleSubtaskComplete(task.id, c.id)}
-                />
-                <span>{c.title}</span>
-              </label>
-            ))}
-            {(task.children!.length > 6) && (
-              <span className="muted tiny">+{task.children!.length - 6} more…</span>
-            )}
-          </div>
-        ) : null}
+        {subtasksSection}
       </div>
     );
   }
@@ -2695,10 +2878,11 @@ export default function App() {
             </div>
           </div>
 
-          <div className="right row gap">
+          <div className="right row gap topbar">
             {state.section !== "today" && (
               <>
             <select
+              className="top-select"
               value={state.mode}
               onChange={(e) => setStatePreserveScroll((s) => ({ ...s, mode: e.target.value as Mode }))}
               title="Mode"
@@ -2707,6 +2891,7 @@ export default function App() {
               <option value="edit">Edit</option>
             </select>
             <select
+              className="top-select"
               value={state.sortBy}
               onChange={(e) => setStatePreserveScroll((s) => ({ ...s, sortBy: e.target.value as SortBy }))}
               title="Sort"
@@ -2717,6 +2902,7 @@ export default function App() {
               <option value="iu">ICE × Urgency</option>
             </select>
             <select
+              className="top-select"
               value={state.view}
               onChange={(e) => setStatePreserveScroll((s) => ({ ...s, view: e.target.value as View }))}
               title="View"
@@ -2731,6 +2917,7 @@ export default function App() {
 
             {/* Theme selector */}
             <select
+              className="top-select top-select-small"
               value={state.theme}
               onChange={(e) =>
                 setStatePreserveScroll((s) => ({ ...s, theme: e.target.value as Theme }))
@@ -2744,22 +2931,22 @@ export default function App() {
               <option value="rainbow">Rainbow</option>
             </select>
 
-            <button className="tiny" onClick={() => setHelpOpen(true)} title="How to use">
-              <HelpCircle size={14} /> ?
+            <button className="top-icon" onClick={() => setHelpOpen(true)} title="How to use">
+              <HelpCircle size={16} />
             </button>
 
             {authOn && !user && (
-              <button className="tiny" onClick={openAuth} title="Sign in (optional)">
-                <LogIn size={14} /> Sign in
+              <button className="top-toggle" onClick={openAuth} title="Sign in (optional)">
+                <LogIn size={14} /> <span className="top-label">Sign in</span>
               </button>
             )}
             {user && (
-              <button className="tiny" onClick={() => void signOut()} title="Sign out">
-                <LogOut size={14} /> Sign out
+              <button className="top-toggle" onClick={() => void signOut()} title="Sign out">
+                <LogOut size={14} /> <span className="top-label">Sign out</span>
               </button>
             )}
             <button
-              className={`tiny ${state.celebrationsEnabled ? "active" : ""}`}
+              className={`top-icon ${state.celebrationsEnabled ? "active" : ""}`}
               onClick={() =>
                 setStatePreserveScroll((s) => ({
                   ...s,
@@ -2776,28 +2963,28 @@ export default function App() {
               🎉
             </button>
             <button
-              className="tiny"
+              className="top-toggle"
               onClick={() => setStatePreserveScroll((s) => ({ ...s, showArchived: !s.showArchived }))}
               title={state.showArchived ? "Hide archived tasks" : "Show archived tasks"}
             >
-              {state.showArchived ? "Hide" : "Show"} archived
+              <span className="top-label">{state.showArchived ? "Hide" : "Show"} archived</span>
             </button>
             {state.section !== "today" && (
             <button
-              className={`tiny ${state.focus ? "active" : ""}`}
+              className={`top-toggle top-focus ${state.focus ? "active" : ""}`}
               onClick={() => setStatePreserveScroll((s) => ({ ...s, focus: !s.focus }))}
               title="Focus mode narrows results (Board: top-2/col • Matrix: top-5/quad • Scatter: top-25 • Graph: top-3/lane)"
             >
-              Focus
+              <span className="top-label">Focus</span>
             </button>
             )}
             {state.section !== "today" && (
             <button
-              className="tiny"
+              className="top-toggle"
               onClick={() => setStatePreserveScroll((s) => ({ ...s, showCompleted: !s.showCompleted }))}
               title={state.showCompleted ? "Hide completed" : "Show completed"}
             >
-              {state.showCompleted ? "Hide" : "Show"} done
+              <span className="top-label">{state.showCompleted ? "Hide" : "Show"} done</span>
             </button>
             )}
           </div>
@@ -2805,6 +2992,7 @@ export default function App() {
 
         {/* ICE guide on Work / Life boards */}
         {(state.section === "work" || state.section === "life") && <IceHelpPanel />}
+        {(state.section === "work" || state.section === "life") && <BoardPrintSheet />}
 
         {/* Toolbar */}
         {state.section !== "today" && (
@@ -2845,6 +3033,16 @@ export default function App() {
               <button className="tiny" onClick={exportCSV} title="Download CSV">
                 <Download size={14} /> CSV
               </button>
+              {(state.section === "work" || state.section === "life") && (
+                <>
+                  <button className="tiny" onClick={downloadBoardPdf} title="Download board as PDF">
+                    <Printer size={14} /> PDF
+                  </button>
+                  <button className="tiny" onClick={downloadBoardTxt} title="Download a plain-text list (email-friendly)">
+                    <Download size={14} /> TXT
+                  </button>
+                </>
+              )}
               <button className="tiny" onClick={() => fileInputJSON.current?.click()} title="Upload JSON">
                 <Upload size={14} /> JSON
               </button>
@@ -3418,6 +3616,56 @@ a { color: var(--accent); text-decoration: none; }
 .left { display: flex; align-items: center; gap: 8px; }
 .center { display: flex; justify-content: center; }
 .right { display: flex; justify-content: flex-end; }
+.topbar { align-items: center; flex-wrap: wrap; gap: 8px; }
+.top-select {
+  font-size: 12px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--bg-elev) 72%, transparent);
+  min-height: 30px;
+}
+.top-select:hover { border-color: var(--accent); }
+.top-select:focus { outline: 2px solid var(--accent-weak); outline-offset: 1px; }
+.top-select-small { padding: 6px 8px; opacity: 0.9; }
+
+.top-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  border-radius: 999px;
+  background: transparent;
+  cursor: pointer;
+  color: var(--muted);
+  min-height: 30px;
+}
+.top-toggle:hover {
+  border-color: var(--border);
+  color: var(--text);
+  background: color-mix(in srgb, var(--bg-elev) 45%, transparent);
+}
+.top-toggle.active { border-color: var(--accent); color: var(--text); background: var(--accent-weak); }
+
+.top-icon {
+  width: 34px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  background: transparent;
+  cursor: pointer;
+}
+.top-icon:hover { border-color: var(--border); background: color-mix(in srgb, var(--bg-elev) 45%, transparent); }
+.top-icon.active { border-color: var(--accent); background: var(--accent-weak); }
+
+.top-focus { font-weight: 700; color: var(--text); border-color: color-mix(in srgb, var(--accent) 60%, var(--border)); }
+.top-focus:not(.active) { background: color-mix(in srgb, var(--bg-elev) 55%, transparent); }
+
+.top-label { white-space: nowrap; }
 
 .logo { width: 36px; height: 36px; border-radius: 50%; overflow: hidden; background: var(--border); display:flex; align-items:center; justify-content:center; }
 .logo img { width: 100%; height: 100%; object-fit: cover; }
@@ -3521,6 +3769,56 @@ a { color: var(--accent); text-decoration: none; }
 .os-item.done { opacity: 0.7; }
 .os-item input { accent-color: var(--accent); }
 
+.subtasks-focus-dropdown {
+  margin-top: 4px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 4px 8px;
+  background: color-mix(in srgb, var(--bg-elev) 60%, transparent);
+}
+.subtasks-focus-dropdown summary {
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--muted);
+  list-style: none;
+}
+.subtasks-focus-dropdown summary::-webkit-details-marker { display: none; }
+.subtasks-focus-list { margin-top: 6px; display: flex; flex-direction: column; gap: 4px; }
+.subtasks-focus-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  padding: 2px 0;
+}
+.subtasks-focus-item.done { opacity: 0.65; text-decoration: line-through; }
+
+.board-print-sheet {
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: -1;
+  opacity: 0;
+  pointer-events: none;
+  width: 900px;
+  background: #fff;
+  color: #111;
+  padding: 28px 32px;
+  font-size: 13px;
+  line-height: 1.45;
+}
+.board-print-sheet .print-struck { text-decoration: line-through; opacity: 0.65; }
+.board-print-sheet h1 { font-size: 22px; margin: 0 0 6px; color: #111; }
+.board-print-sheet h2 { font-size: 14px; margin: 0 0 8px; text-transform: uppercase; color: #333; }
+.board-print-meta { margin: 0 0 4px; color: #555; font-size: 12px; }
+.board-print-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-top: 16px; }
+.board-print-col { border: 1px solid #ccc; border-radius: 8px; padding: 10px 12px; }
+.board-print-col ul { margin: 0; padding-left: 18px; }
+.board-print-col li { margin: 8px 0; }
+.board-print-scores { display: block; font-size: 11px; color: #555; margin-top: 2px; }
+.board-print-subs { margin-top: 4px; padding-left: 16px; font-size: 11px; color: #444; }
+.board-print-empty { margin: 0; color: #888; }
+
 .learn-footer {
   display: flex;
   align-items: center;
@@ -3605,6 +3903,8 @@ svg .muted { fill: var(--muted); }
 .today-simple-item.done .today-simple-title { color: var(--muted); }
 .today-simple-title { width: 100%; border: none; background: transparent; padding: 4px 0; }
 .today-simple-title:focus { outline: none; border-bottom: 1px solid var(--border); }
+.today-simple-section .today-print-only { color: #111; background: transparent; }
+.today-simple-section .today-print-only li { margin: 6px 0; font-size: 14px; }
 
 .ice-help {
   margin: 0 0 12px;
@@ -3622,6 +3922,8 @@ svg .muted { fill: var(--muted); }
 .today-print-only { display: none; }
 .screen-only { display: block; }
 .print-struck { text-decoration: line-through; }
+
+.today-quote.is-default { color: var(--muted); }
 
 .help-overlay { position: fixed; inset: 0; z-index: 2100; display: grid; place-items: center; }
 .help-backdrop { position: fixed; inset: 0; background: rgba(8, 10, 24, 0.55); backdrop-filter: blur(3px); border: none; }
