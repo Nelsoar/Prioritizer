@@ -27,6 +27,8 @@ import {
   LogIn,
   Printer,
   HelpCircle,
+  GripVertical,
+  RotateCcw,
 } from "lucide-react";
 import { useAuth, useProfilePicker } from "./auth/AuthProvider";
 import { Celebration } from "./components/Celebration";
@@ -94,6 +96,11 @@ type TodayPlan = {
   mainRef: TodaySlotRef | null;
   mainDone: boolean;
   mainHoursLogged: number;
+  /** Allow >3 work/life slots + a second deep-work block */
+  extraMode: boolean;
+  extraMainRef: TodaySlotRef | null;
+  extraMainDone: boolean;
+  extraMainHoursLogged: number;
   workMode: TodayPickMode;
   lifeMode: TodayPickMode;
   workSlots: TodaySlot[];
@@ -127,6 +134,7 @@ type AppState = {
   today: TodayPlan;
   celebrationsEnabled: boolean;
   celebrationPromptShown: boolean;
+  syncTodayCompletion: boolean;
 };
 
 /* =======================
@@ -172,6 +180,15 @@ function nowDateTimeLabel() {
     hour: "numeric",
     minute: "2-digit",
   });
+}
+
+/** Filename-safe stamp: YYYY-MM-DD-HHmmss (unique within a day) */
+function exportFileStamp() {
+  const d = new Date();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}-${pad(d.getHours())}${pad(
+    d.getMinutes()
+  )}${pad(d.getSeconds())}`;
 }
 
 async function downloadElementPdf(node: HTMLElement | null, filename: string) {
@@ -267,6 +284,7 @@ function buildAppState(persisted: Partial<AppState> | null): AppState {
     search: "",
     celebrationsEnabled: persisted?.celebrationsEnabled ?? true,
     celebrationPromptShown: persisted?.celebrationPromptShown ?? false,
+    syncTodayCompletion: persisted?.syncTodayCompletion ?? true,
   };
 }
 
@@ -294,6 +312,10 @@ const emptyTodayPlan = (): TodayPlan => ({
   mainRef: null,
   mainDone: false,
   mainHoursLogged: 0,
+  extraMode: false,
+  extraMainRef: null,
+  extraMainDone: false,
+  extraMainHoursLogged: 0,
   workMode: "tasks",
   lifeMode: "tasks",
   workSlots: emptyTodaySlots(),
@@ -306,7 +328,7 @@ const normalizeSlots = (
   legacyIds: (string | null)[] | undefined
 ): TodaySlot[] => {
   if (Array.isArray(slots) && slots.length) {
-    const base = slots.slice(0, 3).map((s) => ({
+    const base = slots.map((s) => ({
       ref: s?.ref ?? null,
       done: !!s?.done,
     }));
@@ -318,10 +340,9 @@ const normalizeSlots = (
   return ids.map((id) => ({ ref: id ? { kind: "task" as const, taskId: id } : null, done: false }));
 };
 const normalizeTodayPlan = (plan: Partial<TodayPlan> | undefined): TodayPlan => {
-  const today = todayDateKey();
-  if (!plan || plan.date !== today) return emptyTodayPlan();
+  if (!plan) return emptyTodayPlan();
   return {
-    date: today,
+    date: plan.date || todayDateKey(),
     mainRef:
       plan.mainRef ??
       ((plan as { mainTaskId?: string | null }).mainTaskId
@@ -329,6 +350,10 @@ const normalizeTodayPlan = (plan: Partial<TodayPlan> | undefined): TodayPlan => 
         : null),
     mainDone: !!plan.mainDone,
     mainHoursLogged: numOr(plan.mainHoursLogged, 0),
+    extraMode: !!plan.extraMode,
+    extraMainRef: plan.extraMainRef ?? null,
+    extraMainDone: !!plan.extraMainDone,
+    extraMainHoursLogged: numOr(plan.extraMainHoursLogged, 0),
     workMode: plan.workMode === "subtasks" ? "subtasks" : "tasks",
     lifeMode: plan.lifeMode === "subtasks" ? "subtasks" : "tasks",
     workSlots: normalizeSlots(plan.workSlots, plan.workSlotIds),
@@ -376,9 +401,62 @@ const markTodayDoneForTask = (plan: TodayPlan, taskId: string): TodayPlan => {
   };
   const mainMatches =
     plan.mainRef?.kind === "task" && plan.mainRef.taskId === taskId;
+  const extraMatches =
+    plan.extraMainRef?.kind === "task" && plan.extraMainRef.taskId === taskId;
   return {
     ...plan,
     mainDone: mainMatches ? true : plan.mainDone,
+    extraMainDone: extraMatches ? true : plan.extraMainDone,
+    workSlots: plan.workSlots.map(mark),
+    lifeSlots: plan.lifeSlots.map(mark),
+  };
+};
+const unmarkTodayDoneForTask = (plan: TodayPlan, taskId: string): TodayPlan => {
+  const unmark = (slot: TodaySlot): TodaySlot => {
+    if (!slot.ref) return slot;
+    if (slot.ref.kind === "task" && slot.ref.taskId === taskId) return { ...slot, done: false };
+    return slot;
+  };
+  const mainMatches =
+    plan.mainRef?.kind === "task" && plan.mainRef.taskId === taskId;
+  const extraMatches =
+    plan.extraMainRef?.kind === "task" && plan.extraMainRef.taskId === taskId;
+  return {
+    ...plan,
+    mainDone: mainMatches ? false : plan.mainDone,
+    extraMainDone: extraMatches ? false : plan.extraMainDone,
+    workSlots: plan.workSlots.map(unmark),
+    lifeSlots: plan.lifeSlots.map(unmark),
+  };
+};
+const setTodayDoneForSubtask = (
+  plan: TodayPlan,
+  taskId: string,
+  subtaskId: string,
+  done: boolean
+): TodayPlan => {
+  const mark = (slot: TodaySlot): TodaySlot => {
+    if (
+      slot.ref?.kind === "subtask" &&
+      slot.ref.taskId === taskId &&
+      slot.ref.subtaskId === subtaskId
+    ) {
+      return { ...slot, done };
+    }
+    return slot;
+  };
+  const mainMatches =
+    plan.mainRef?.kind === "subtask" &&
+    plan.mainRef.taskId === taskId &&
+    plan.mainRef.subtaskId === subtaskId;
+  const extraMatches =
+    plan.extraMainRef?.kind === "subtask" &&
+    plan.extraMainRef.taskId === taskId &&
+    plan.extraMainRef.subtaskId === subtaskId;
+  return {
+    ...plan,
+    mainDone: mainMatches ? done : plan.mainDone,
+    extraMainDone: extraMatches ? done : plan.extraMainDone,
     workSlots: plan.workSlots.map(mark),
     lifeSlots: plan.lifeSlots.map(mark),
   };
@@ -391,11 +469,15 @@ const clearTodayRefsForTask = (plan: TodayPlan, taskId: string): TodayPlan => {
     return slot;
   };
   const clearMain = plan.mainRef?.taskId === taskId ? null : plan.mainRef;
+  const clearExtra = plan.extraMainRef?.taskId === taskId ? null : plan.extraMainRef;
   return {
     ...plan,
     mainRef: clearMain,
     mainDone: clearMain ? plan.mainDone : false,
     mainHoursLogged: clearMain ? plan.mainHoursLogged : 0,
+    extraMainRef: clearExtra,
+    extraMainDone: clearExtra ? plan.extraMainDone : false,
+    extraMainHoursLogged: clearExtra ? plan.extraMainHoursLogged : 0,
     workSlots: plan.workSlots.map(clear),
     lifeSlots: plan.lifeSlots.map(clear),
   };
@@ -437,16 +519,26 @@ type CommitInputProps = React.InputHTMLAttributes<HTMLInputElement> & {
   value: string;
   onCommit: (next: string) => void;
 };
-function CommitInput({ value, onCommit, onKeyDown, ...rest }: CommitInputProps) {
+function CommitInput({ value, onCommit, onKeyDown, onFocus, onBlur, ...rest }: CommitInputProps) {
   const [v, setV] = React.useState(value ?? "");
-  React.useEffect(() => setV(value ?? ""), [value]);
+  const focused = React.useRef(false);
+  // Only sync from parent when not editing — prevents caret jumping / reverse typing
+  React.useEffect(() => {
+    if (!focused.current) setV(value ?? "");
+  }, [value]);
   return (
     <input
       {...rest}
       value={v}
       onChange={(e) => setV(e.target.value)}
-      onBlur={() => {
+      onFocus={(e) => {
+        focused.current = true;
+        onFocus?.(e);
+      }}
+      onBlur={(e) => {
+        focused.current = false;
         if (v !== value) onCommit(v);
+        onBlur?.(e);
       }}
       onKeyDown={(e) => {
         if (e.key === "Enter") (e.currentTarget as HTMLInputElement).blur();
@@ -464,16 +556,25 @@ type CommitTextareaProps = React.TextareaHTMLAttributes<HTMLTextAreaElement> & {
   value: string;
   onCommit: (next: string) => void;
 };
-function CommitTextarea({ value, onCommit, onKeyDown, ...rest }: CommitTextareaProps) {
+function CommitTextarea({ value, onCommit, onKeyDown, onFocus, onBlur, ...rest }: CommitTextareaProps) {
   const [v, setV] = React.useState(value ?? "");
-  React.useEffect(() => setV(value ?? ""), [value]);
+  const focused = React.useRef(false);
+  React.useEffect(() => {
+    if (!focused.current) setV(value ?? "");
+  }, [value]);
   return (
     <textarea
       {...rest}
       value={v}
       onChange={(e) => setV(e.target.value)}
-      onBlur={() => {
+      onFocus={(e) => {
+        focused.current = true;
+        onFocus?.(e);
+      }}
+      onBlur={(e) => {
+        focused.current = false;
         if (v !== value) onCommit(v);
+        onBlur?.(e);
       }}
       onKeyDown={(e) => {
         if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
@@ -787,6 +888,7 @@ export default function App() {
   const [celebrationOpen, setCelebrationOpen] = useState(false);
   const [celebrationTick, setCelebrationTick] = useState(0);
   const [helpOpen, setHelpOpen] = useState(false);
+  const [draggingType, setDraggingType] = useState<string | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const columnRefs = useRef<Record<Status, HTMLDivElement | null>>({
     now: null,
@@ -798,14 +900,6 @@ export default function App() {
     setState(buildAppState(loadPersistedState(storageKey)));
     setHasLoaded(true);
   }, [storageKey]);
-
-  // Roll Today plan forward when the calendar day changes
-  useEffect(() => {
-    const today = todayDateKey();
-    if (state.today.date !== today) {
-      setState((s) => ({ ...s, today: emptyTodayPlan() }));
-    }
-  }, [state.today.date]);
 
   // Debounced autosave
   const saveTimer = useRef<number | null>(null);
@@ -871,6 +965,62 @@ export default function App() {
       ...s,
       today: { ...s.today, ...patch, date: todayDateKey() },
     }));
+
+  /** Create a board task from Today and assign it to a slot / deep-work picker */
+  const createTodayTask = (
+    board: BoardKind,
+    title: string,
+    assign:
+      | { kind: "main" }
+      | { kind: "extraMain" }
+      | { kind: "slot"; slotKey: "workSlots" | "lifeSlots"; idx: number }
+  ) => {
+    const trimmed = title.trim();
+    if (!trimmed) return;
+    setStatePreserveScroll((s) => {
+      const now = Date.now();
+      const status: Status = "now";
+      const maxOrder =
+        s.tasks
+          .filter((t) => t.status === status && (t.board || "work") === board)
+          .reduce((m, t) => Math.max(m, t.order), -1) + 1;
+      const task: Task = {
+        id: uid(),
+        title: trimmed,
+        status,
+        board,
+        impact: DEFAULT_TASK_SCORE,
+        confidence: DEFAULT_TASK_SCORE,
+        ease: DEFAULT_TASK_SCORE,
+        urgency: DEFAULT_TASK_SCORE,
+        completed: false,
+        order: maxOrder,
+        createdAt: now,
+        updatedAt: now,
+        children: [],
+        deliverables: [],
+        tags: board === "life" ? ["life"] : [],
+        deps: [],
+        owner: "",
+        details: "",
+        estimateH: null,
+        due: null,
+      };
+      const ref: TodaySlotRef = { kind: "task", taskId: task.id };
+      let today: TodayPlan = { ...s.today, date: todayDateKey() };
+      if (assign.kind === "main") {
+        today = { ...today, mainRef: ref, mainHoursLogged: 0, mainDone: false };
+      } else if (assign.kind === "extraMain") {
+        today = { ...today, extraMainRef: ref, extraMainHoursLogged: 0, extraMainDone: false };
+      } else {
+        const next = [...today[assign.slotKey]];
+        while (next.length <= assign.idx) next.push({ ref: null, done: false });
+        next[assign.idx] = { ref, done: false };
+        today = { ...today, [assign.slotKey]: next };
+      }
+      return { ...s, tasks: [...s.tasks, task], today };
+    });
+  };
 
   // Derived indexes
   const taskById = useMemo(() => {
@@ -998,11 +1148,19 @@ export default function App() {
 
   // Mutators
   const updateTask = (id: string, patch: Partial<Task>) =>
-    setStatePreserveScroll((s) => ({
-      ...s,
-      today: patch.completed === true ? markTodayDoneForTask(s.today, id) : s.today,
-      tasks: s.tasks.map((t) => (t.id === id ? { ...t, ...patch, updatedAt: Date.now() } : t)),
-    }));
+    setStatePreserveScroll((s) => {
+      let today = s.today;
+      if (patch.completed === true) {
+        today = markTodayDoneForTask(today, id);
+      } else if (patch.completed === false) {
+        today = unmarkTodayDoneForTask(today, id);
+      }
+      return {
+        ...s,
+        today,
+        tasks: s.tasks.map((t) => (t.id === id ? { ...t, ...patch, updatedAt: Date.now() } : t)),
+      };
+    });
 
   const toggleTaskComplete = (id: string) => {
     const task = taskById.get(id);
@@ -1022,10 +1180,16 @@ export default function App() {
     const arr = (task.children || []).map((x) =>
       x.id === subtaskId ? { ...x, completed: next, updatedAt: Date.now() } : x
     );
-    updateTask(taskId, { children: arr });
+    setStatePreserveScroll((s) => ({
+      ...s,
+      today: setTodayDoneForSubtask(s.today, taskId, subtaskId, next),
+      tasks: s.tasks.map((t) =>
+        t.id === taskId ? { ...t, children: arr, updatedAt: Date.now() } : t
+      ),
+    }));
   };
 
-  const addTask = (status: Status, title = "New task", board?: BoardKind) => {
+  const addTask = (status: Status, title = "New task", board?: BoardKind): Task => {
     const now = Date.now();
     const boardKind = board ?? activeBoard;
     const maxOrder =
@@ -1055,6 +1219,7 @@ export default function App() {
       due: null,
     };
     setStatePreserveScroll((s) => ({ ...s, tasks: [...s.tasks, t] }));
+    return t;
   };
 
   const archiveTask = (id: string) =>
@@ -1142,16 +1307,74 @@ export default function App() {
   /* =======================
      Drag & Drop — robust cross-column move
   ======================= */
+  const moveTaskToStatus = (taskId: string, dstStatus: Status, insertIndex?: number) => {
+    setStatePreserveScroll((s) => {
+      const now = Date.now();
+      const moving = s.tasks.find((t) => t.id === taskId);
+      if (!moving) return s;
+      const srcStatus = moving.status;
+      if (srcStatus === dstStatus) return s;
+      const board = moving.board || "work";
+      const dstCount =
+        s.tasks.filter(
+          (t) => t.status === dstStatus && t.id !== taskId && (t.board || "work") === board
+        ).length + 1;
+      if (!canDropInto(dstStatus, dstCount)) {
+        const limit = s.wip[dstStatus];
+        window.setTimeout(() => {
+          alert(`WIP limit for ${dstStatus.toUpperCase()} is ${limit}. Raise WIP (0 = unlimited) to move this task.`);
+        }, 0);
+        return s;
+      }
+      const srcCol = s.tasks
+        .filter((t) => t.status === srcStatus && t.id !== taskId && (t.board || "work") === board)
+        .sort((a, b) => a.order - b.order);
+      const dstCol = s.tasks
+        .filter((t) => t.status === dstStatus && (t.board || "work") === board)
+        .sort((a, b) => a.order - b.order);
+      const insertIdx =
+        insertIndex == null ? dstCol.length : Math.min(Math.max(0, insertIndex), dstCol.length);
+      dstCol.splice(insertIdx, 0, { ...moving, status: dstStatus, updatedAt: now });
+      const reindexed = new Map<string, { status: Status; order: number }>();
+      srcCol.forEach((t, i) => reindexed.set(t.id, { status: srcStatus, order: i }));
+      dstCol.forEach((t, i) => reindexed.set(t.id, { status: dstStatus, order: i }));
+      return {
+        ...s,
+        tasks: s.tasks.map((t) =>
+          reindexed.has(t.id)
+            ? {
+                ...t,
+                status: reindexed.get(t.id)!.status,
+                order: reindexed.get(t.id)!.order,
+                updatedAt: now,
+              }
+            : t
+        ),
+      };
+    });
+  };
+
   function onDragEnd(result: DropResult) {
+    setDraggingType(null);
     const { source, destination, draggableId, type } = result;
     if (!destination) return;
 
     if (type === "TASK") {
       const srcStatus = source.droppableId as Status;
       const dstStatus = destination.droppableId as Status;
+      if (!statuses.includes(dstStatus)) return;
       const movingTaskId = draggableId.replace("task-", "");
       const sameColumn = srcStatus === dstStatus;
       const manualReorderAllowed = state.sortBy === "manual" && !state.focus;
+
+      if (!sameColumn) {
+        moveTaskToStatus(
+          movingTaskId,
+          dstStatus,
+          state.sortBy === "manual" ? destination.index : undefined
+        );
+        return;
+      }
 
       setStatePreserveScroll((s) => {
         const now = Date.now();
@@ -1159,53 +1382,6 @@ export default function App() {
         // sanity: ensure moving exists
         const moving = s.tasks.find((t) => t.id === movingTaskId);
         if (!moving) return s;
-
-        if (!sameColumn) {
-          // WIP check (exclude the moving task if it's already in dst)
-          const dstCount =
-            s.tasks.filter(
-              (t) =>
-                t.status === dstStatus &&
-                t.id !== movingTaskId &&
-                (t.board || "work") === (moving.board || "work")
-            ).length + 1;
-          if (!canDropInto(dstStatus, dstCount)) return s;
-
-          // Build source & destination ordered arrays (order matters only for Manual)
-          const board = moving.board || "work";
-          const srcCol = s.tasks
-            .filter(
-              (t) =>
-                t.status === srcStatus && t.id !== movingTaskId && (t.board || "work") === board
-            )
-            .sort((a, b) => a.order - b.order);
-          const dstCol = s.tasks
-            .filter((t) => t.status === dstStatus && (t.board || "work") === board)
-            .sort((a, b) => a.order - b.order);
-
-          const insertIdx = state.sortBy === "manual" ? destination.index : dstCol.length;
-          const moved = { ...moving, status: dstStatus, updatedAt: now };
-          dstCol.splice(Math.min(Math.max(0, insertIdx), dstCol.length), 0, moved);
-
-          // Reindex orders for both columns (keeps Manual tidy; harmless otherwise)
-          const reindexed = new Map<string, { status: Status; order: number }>();
-          srcCol.forEach((t, i) => reindexed.set(t.id, { status: srcStatus, order: i }));
-          dstCol.forEach((t, i) => reindexed.set(t.id, { status: dstStatus, order: i }));
-
-          return {
-            ...s,
-            tasks: s.tasks.map((t) =>
-              reindexed.has(t.id)
-                ? {
-                    ...t,
-                    status: reindexed.get(t.id)!.status,
-                    order: reindexed.get(t.id)!.order,
-                    updatedAt: now,
-                  }
-                : t
-            ),
-          };
-        }
 
         // Same-column reorder only when Manual+no Focus
         if (sameColumn && manualReorderAllowed) {
@@ -1277,8 +1453,7 @@ export default function App() {
     URL.revokeObjectURL(url);
   }
   function exportFilename(ext: string) {
-    const date = new Date().toISOString().slice(0, 10);
-    return `prioritizer-${date}.${ext}`;
+    return `prioritizer-${exportFileStamp()}.${ext}`;
   }
   function exportJSON() {
     const blob = new Blob([JSON.stringify({ ...state, search: "" }, null, 2)], {
@@ -1542,14 +1717,14 @@ export default function App() {
 
   const downloadBoardPdf = () => {
     const label = state.section === "life" ? "life" : "work";
-    void downloadElementPdf(boardPrintRef.current, `${label}-board-${todayDateKey()}.pdf`);
+    void downloadElementPdf(boardPrintRef.current, `${label}-board-${exportFileStamp()}.pdf`);
   };
 
   const downloadBoardTxt = () => {
     const label = state.section === "life" ? "life" : "work";
     const title = state.section === "life" ? "Life" : "Work";
     const lines: string[] = [];
-    lines.push(`${title} — Now / Next / Later`);
+    lines.push(`${title} — Prioritizer`);
     lines.push(`Date: ${nowDateTimeLabel()}`);
     lines.push(
       `Focus: ${state.focus ? "on" : "off"} | Hide done: ${state.showCompleted ? "off" : "on"} | Search: ${
@@ -1576,7 +1751,7 @@ export default function App() {
       }
       lines.push("");
     }
-    downloadTextFile(`${label}-board-${todayDateKey()}.txt`, lines.join("\n").trimEnd() + "\n");
+    downloadTextFile(`${label}-board-${exportFileStamp()}.txt`, lines.join("\n").trimEnd() + "\n");
   };
 
   function IceHelpPanel() {
@@ -1664,7 +1839,7 @@ export default function App() {
     return (
       <div ref={boardPrintRef} className="board-print-sheet" aria-hidden="true">
         <h1>
-          {boardLabel} — Now / Next / Later
+          {boardLabel} — Prioritizer
         </h1>
         <p className="board-print-meta">{printDate}</p>
         {state.focus && <p className="board-print-meta">Focus: top 2 per column</p>}
@@ -1717,21 +1892,35 @@ export default function App() {
   function TodayView() {
     const plan = state.today;
     const [todoDraft, setTodoDraft] = useState("");
+    const [quickDrafts, setQuickDrafts] = useState<Record<string, string>>({});
     const workPool = pickerTasks("work");
     const lifePool = pickerTasks("life");
     const workSubPool = pickerSubtasks("work");
     const lifeSubPool = pickerSubtasks("life");
     const mainLabel = slotLabel(plan.mainRef);
-    const hoursPct = Math.min(100, Math.round((plan.mainHoursLogged / 3) * 100));
-    const mainDone = plan.mainDone || refCompleted(plan.mainRef, state.tasks);
+    const extraMainLabel = slotLabel(plan.extraMainRef);
+    const mainDone = refCompleted(plan.mainRef, state.tasks);
+    const extraMainDone = refCompleted(plan.extraMainRef, state.tasks);
     const mainRefKey = slotRefKey(plan.mainRef) || "";
+    const extraMainRefKey = slotRefKey(plan.extraMainRef) || "";
+    const extraOn = !!plan.extraMode;
+    const workSlots = plan.workSlots;
+    const lifeSlots = plan.lifeSlots;
+    const visibleWork = extraOn ? workSlots : workSlots.slice(0, 3);
+    const visibleLife = extraOn ? lifeSlots : lifeSlots.slice(0, 3);
 
     const usedRefKeys = new Set(
       [
-        ...plan.workSlots.map((s) => slotRefKey(s.ref)),
-        ...plan.lifeSlots.map((s) => slotRefKey(s.ref)),
+        ...workSlots.map((s) => slotRefKey(s.ref)),
+        ...lifeSlots.map((s) => slotRefKey(s.ref)),
         slotRefKey(plan.mainRef),
       ].filter(Boolean) as string[]
+    );
+    // Extra deep work may reuse the same main task
+    const usedForExtraMain = new Set(
+      [...workSlots.map((s) => slotRefKey(s.ref)), ...lifeSlots.map((s) => slotRefKey(s.ref))].filter(
+        Boolean
+      ) as string[]
     );
 
     const downloadTodayPdf = () => {
@@ -1740,25 +1929,34 @@ export default function App() {
 
     const downloadTodayTxt = () => {
       const lines: string[] = [];
-      lines.push("Today — 3·3·3");
+      lines.push(extraOn ? "Today — 3·3·3 + EXTRA" : "Today — 3·3·3");
       lines.push(`Date: ${nowDateTimeLabel()}`);
       lines.push("");
-      lines.push("Deep work (3h):");
+      lines.push(extraOn ? "Deep work (3h+):" : "Deep work (3h):");
       lines.push(
         `- ${plan.mainRef ? (mainDone ? "[x]" : "[ ]") : "[ ]"} ${
           plan.mainRef ? mainLabel : "(not set)"
-        } (${plan.mainHoursLogged.toFixed(1)} / 3 h)`
+        } (${plan.mainHoursLogged.toFixed(1)} h)`
       );
       lines.push("");
-      lines.push("3 work:");
-      plan.workSlots.forEach((s) => {
+      lines.push(`${visibleWork.length} work:`);
+      visibleWork.forEach((s) => {
         lines.push(`- ${s.ref ? (s.done ? "[x]" : "[ ]") : "[ ]"} ${s.ref ? slotLabel(s.ref) : "(empty slot)"}`);
       });
       lines.push("");
-      lines.push("3 life:");
-      plan.lifeSlots.forEach((s) => {
+      lines.push(`${visibleLife.length} life:`);
+      visibleLife.forEach((s) => {
         lines.push(`- ${s.ref ? (s.done ? "[x]" : "[ ]") : "[ ]"} ${s.ref ? slotLabel(s.ref) : "(empty slot)"}`);
       });
+      if (extraOn) {
+        lines.push("");
+        lines.push("Extra deep work:");
+        lines.push(
+          `- ${plan.extraMainRef ? (extraMainDone ? "[x]" : "[ ]") : "[ ]"} ${
+            plan.extraMainRef ? extraMainLabel : "(not set)"
+          } (${plan.extraMainHoursLogged.toFixed(1)} h)`
+        );
+      }
       lines.push("");
       lines.push("Quick to-dos:");
       if (plan.simpleTodos.length === 0) lines.push("- (none)");
@@ -1801,65 +1999,404 @@ export default function App() {
       updateToday({ simpleTodos: plan.simpleTodos.filter((t) => t.id !== id) });
     };
 
+    const resetAllToday = () => {
+      const ok = window.confirm(
+        "Reset Today plan?\n\nThis will clear all chosen tasks, logged hours, and quick to-dos."
+      );
+      if (!ok) return;
+      updateToday({
+        mainRef: null,
+        mainDone: false,
+        mainHoursLogged: 0,
+        extraMainRef: null,
+        extraMainDone: false,
+        extraMainHoursLogged: 0,
+        workSlots: emptyTodaySlots(),
+        lifeSlots: emptyTodaySlots(),
+        simpleTodos: [],
+      });
+    };
+
+    const resetCompletedToday = () => {
+      const isSlotCompleted = (slot: TodaySlot) =>
+        Boolean(slot.done || refCompleted(slot.ref, state.tasks));
+      const isMainCompleted = Boolean(refCompleted(plan.mainRef, state.tasks));
+      const isExtraMainCompleted = Boolean(refCompleted(plan.extraMainRef, state.tasks));
+
+      const newWorkSlots = plan.workSlots.map((s) =>
+        isSlotCompleted(s) ? { ref: null, done: false } : s
+      );
+      const newLifeSlots = plan.lifeSlots.map((s) =>
+        isSlotCompleted(s) ? { ref: null, done: false } : s
+      );
+
+      const newMainRef = isMainCompleted ? null : plan.mainRef;
+      const newMainDone = isMainCompleted ? false : plan.mainDone;
+      const newMainHours = isMainCompleted ? 0 : plan.mainHoursLogged;
+
+      const newExtraMainRef = isExtraMainCompleted ? null : plan.extraMainRef;
+      const newExtraMainDone = isExtraMainCompleted ? false : plan.extraMainDone;
+      const newExtraMainHours = isExtraMainCompleted ? 0 : plan.extraMainHoursLogged;
+
+      const newSimpleTodos = plan.simpleTodos.filter((t) => !t.done);
+
+      updateToday({
+        mainRef: newMainRef,
+        mainDone: newMainDone,
+        mainHoursLogged: newMainHours,
+        extraMainRef: newExtraMainRef,
+        extraMainDone: newExtraMainDone,
+        extraMainHoursLogged: newExtraMainHours,
+        workSlots: newWorkSlots,
+        lifeSlots: newLifeSlots,
+        simpleTodos: newSimpleTodos,
+      });
+    };
+
+    const setQuickDraft = (key: string, value: string) =>
+      setQuickDrafts((d) => ({ ...d, [key]: value }));
+
+    const setSlotDone = (
+      slotKey: "workSlots" | "lifeSlots",
+      idx: number,
+      done: boolean
+    ) => {
+      if (done) fireCelebration();
+      setStatePreserveScroll((s) => {
+        const slot = s.today[slotKey][idx];
+        if (!slot) return s;
+        const nextSlots = [...s.today[slotKey]];
+        nextSlots[idx] = { ...slot, done };
+
+        let nextTasks = s.tasks;
+        if (s.syncTodayCompletion && slot.ref) {
+          if (slot.ref.kind === "task") {
+            const taskId = slot.ref.taskId;
+            nextTasks = nextTasks.map((t) =>
+              t.id === taskId ? { ...t, completed: done, updatedAt: Date.now() } : t
+            );
+          } else if (slot.ref.kind === "subtask") {
+            const { taskId, subtaskId } = slot.ref;
+            nextTasks = nextTasks.map((t) => {
+              if (t.id !== taskId) return t;
+              const children = (t.children || []).map((c) =>
+                c.id === subtaskId ? { ...c, completed: done, updatedAt: Date.now() } : c
+              );
+              return { ...t, children, updatedAt: Date.now() };
+            });
+          }
+        }
+
+        return {
+          ...s,
+          tasks: nextTasks,
+          today: { ...s.today, [slotKey]: nextSlots },
+        };
+      });
+    };
+
+    const toggleSlotRefComplete = (ref: TodaySlotRef | null) => {
+      if (!ref) return;
+      if (ref.kind === "task") {
+        toggleTaskComplete(ref.taskId);
+      } else if (ref.kind === "subtask") {
+        toggleSubtaskComplete(ref.taskId, ref.subtaskId);
+      }
+    };
+
+    const submitQuickAdd = (
+      key: string,
+      board: BoardKind,
+      assign:
+        | { kind: "main" }
+        | { kind: "extraMain" }
+        | { kind: "slot"; slotKey: "workSlots" | "lifeSlots"; idx: number }
+    ) => {
+      const title = (quickDrafts[key] || "").trim();
+      if (!title) return;
+      createTodayTask(board, title, assign);
+      setQuickDraft(key, "");
+    };
+
+    const quickAddField = (
+      key: string,
+      board: BoardKind,
+      assign:
+        | { kind: "main" }
+        | { kind: "extraMain" }
+        | { kind: "slot"; slotKey: "workSlots" | "lifeSlots"; idx: number },
+      placeholder = "Or type a new task… (Enter)"
+    ) => (
+      <div className="today-quick-add screen-only">
+        <input
+          value={quickDrafts[key] || ""}
+          onChange={(e) => setQuickDraft(key, e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              submitQuickAdd(key, board, assign);
+            }
+          }}
+          placeholder={placeholder}
+        />
+        <button
+          className="tiny"
+          type="button"
+          onClick={() => submitQuickAdd(key, board, assign)}
+          title="Create task and assign here"
+        >
+          <Plus size={14} />
+        </button>
+      </div>
+    );
+
+    const addSlot = (slotKey: "workSlots" | "lifeSlots") => {
+      updateToday({ [slotKey]: [...plan[slotKey], { ref: null, done: false }] });
+    };
+
+    const removeSlot = (slotKey: "workSlots" | "lifeSlots", idx: number) => {
+      if (plan[slotKey].length <= 3) return;
+      const next = plan[slotKey].filter((_, i) => i !== idx);
+      while (next.length < 3) next.push({ ref: null, done: false });
+      updateToday({ [slotKey]: next });
+    };
+
+    const toggleExtraMode = () => {
+      if (extraOn) {
+        updateToday({ extraMode: false });
+      } else {
+        const work = [...plan.workSlots];
+        const life = [...plan.lifeSlots];
+        while (work.length < 3) work.push({ ref: null, done: false });
+        while (life.length < 3) life.push({ ref: null, done: false });
+        updateToday({
+          extraMode: true,
+          workSlots: work,
+          lifeSlots: life,
+          extraMainRef: plan.extraMainRef,
+          extraMainDone: plan.extraMainDone,
+          extraMainHoursLogged: plan.extraMainHoursLogged,
+        });
+      }
+    };
+
     const slotRow = (
       slotKey: "workSlots" | "lifeSlots",
       pool: Task[],
       subPool: { key: string; ref: TodaySlotRef; label: string }[],
-      idx: number
+      idx: number,
+      board: BoardKind
     ) => {
       const slot = plan[slotKey][idx];
+      if (!slot) return null;
       const label = slotLabel(slot.ref);
       const optionValue = slotRefKey(slot.ref) || "";
+      const canRemove = extraOn && plan[slotKey].length > 3;
+      const isDone = Boolean(slot.done || refCompleted(slot.ref, state.tasks));
 
-      if (slot.done && slot.ref) {
+      if (isDone && slot.ref) {
         return (
           <div key={`${slotKey}-${idx}`} className="today-slot done">
             <span className="slot-num">{idx + 1}</span>
             <span className="today-slot-done-label">{label}</span>
             <button
               className="check"
-              onClick={() => {
-                const next = [...plan[slotKey]];
-                next[idx] = { ...slot, done: false };
-                updateToday({ [slotKey]: next });
-              }}
-              title="Mark not done for today"
+              onClick={() => setSlotDone(slotKey, idx, false)}
+              title={
+                state.syncTodayCompletion
+                  ? "Mark not done (updates Today & boards)"
+                  : "Mark not done for today"
+              }
             >
               <CheckSquare size={16} />
             </button>
+            {canRemove && (
+              <button className="icon screen-only" onClick={() => removeSlot(slotKey, idx)} title="Remove slot">
+                <Trash2 size={14} />
+              </button>
+            )}
           </div>
         );
       }
 
       return (
-        <div key={`${slotKey}-${idx}`} className="today-slot">
-          <span className="slot-num">{idx + 1}</span>
-          <select
-            value={optionValue}
-            onChange={(e) => {
-              const next = [...plan[slotKey]];
-              next[idx] = { ref: parseSlotOption(e.target.value), done: false };
-              updateToday({ [slotKey]: next });
-            }}
-          >
-            <option value="">Pick a task or subtask…</option>
-            {slotPickerOptions(pool, subPool, usedRefKeys, optionValue)}
-          </select>
-          {slot.ref && (
-            <button
-              className="check"
-              onClick={() => {
-                fireCelebration();
+        <div key={`${slotKey}-${idx}`} className="today-slot-block">
+          <div className="today-slot">
+            <span className="slot-num">{idx + 1}</span>
+            <select
+              value={optionValue}
+              onChange={(e) => {
                 const next = [...plan[slotKey]];
-                next[idx] = { ...slot, done: true };
+                next[idx] = { ref: parseSlotOption(e.target.value), done: false };
                 updateToday({ [slotKey]: next });
               }}
-              title="Done for today"
             >
-              <Square size={16} />
-            </button>
-          )}
+              <option value="">Pick a task or subtask…</option>
+              {slotPickerOptions(pool, subPool, usedRefKeys, optionValue)}
+            </select>
+            {slot.ref && (
+              <button
+                className="check"
+                onClick={() => setSlotDone(slotKey, idx, true)}
+                title={
+                  state.syncTodayCompletion
+                    ? "Done (updates Today & boards)"
+                    : "Done for today"
+                }
+              >
+                <Square size={16} />
+              </button>
+            )}
+            {canRemove && (
+              <button className="icon screen-only" onClick={() => removeSlot(slotKey, idx)} title="Remove slot">
+                <Trash2 size={14} />
+              </button>
+            )}
+          </div>
+          {!slot.ref && quickAddField(`slot-${slotKey}-${idx}`, board, { kind: "slot", slotKey, idx })}
         </div>
+      );
+    };
+
+    const hoursBarRows = (hours: number) => {
+      const chunk = 3;
+      const count = hours <= 0 ? 1 : Math.ceil(hours / chunk);
+      return Array.from({ length: count }, (_, i) => {
+        const start = i * chunk;
+        const fill = Math.max(0, Math.min(chunk, hours - start));
+        return {
+          start,
+          end: start + chunk,
+          fill,
+          pct: Math.round((fill / chunk) * 100),
+        };
+      });
+    };
+
+    const deepWorkBlock = (opts: {
+      title: string;
+      hint: string;
+      refKey: string;
+      label: string;
+      done: boolean;
+      hours: number;
+      pool: Task[];
+      subPool: { key: string; ref: TodaySlotRef; label: string }[];
+      used: Set<string>;
+      board: BoardKind;
+      quickKey: string;
+      isExtra?: boolean;
+      className?: string;
+    }) => {
+      const {
+        title,
+        hint,
+        refKey,
+        label,
+        hours,
+        pool,
+        subPool,
+        used,
+        board,
+        quickKey,
+        isExtra,
+        className,
+      } = opts;
+      // In EXTRA mode both deep-work blocks can log past 3h; each 3h chunk gets its own bar row
+      const allowOvertime = !!isExtra || extraOn;
+      const ref = isExtra ? plan.extraMainRef : plan.mainRef;
+      const taskIsComplete = refCompleted(ref, state.tasks);
+      const rows = hoursBarRows(hours);
+      const bumpHours = (delta: number) => {
+        if (isExtra) {
+          updateToday({ extraMainHoursLogged: Math.max(0, plan.extraMainHoursLogged + delta) });
+          return;
+        }
+        if (allowOvertime) {
+          updateToday({ mainHoursLogged: Math.max(0, plan.mainHoursLogged + delta) });
+          return;
+        }
+        updateToday({ mainHoursLogged: Math.min(3, Math.max(0, plan.mainHoursLogged + delta)) });
+      };
+      const resetHours = () => {
+        if (isExtra) updateToday({ extraMainHoursLogged: 0 });
+        else updateToday({ mainHoursLogged: 0 });
+      };
+
+      return (
+        <section className={`today-section today-main-block ${className || ""}`}>
+          <h3>{title}</h3>
+          <p className="muted tiny screen-only">{hint}</p>
+          <select
+            className="today-select screen-only"
+            value={refKey}
+            onChange={(e) => {
+              const r = parseSlotOption(e.target.value);
+              if (isExtra) {
+                updateToday({ extraMainRef: r, extraMainHoursLogged: 0, extraMainDone: false });
+              } else {
+                updateToday({ mainRef: r, mainHoursLogged: 0, mainDone: false });
+              }
+            }}
+          >
+            <option value="">{isExtra ? "Choose extra deep-work task…" : "Choose main task or subtask…"}</option>
+            {slotPickerOptions(pool, subPool, used, refKey)}
+          </select>
+          {!refKey && quickAddField(quickKey, board, isExtra ? { kind: "extraMain" } : { kind: "main" })}
+          {ref && (
+            <div className="hours-tracker screen-only">
+              {rows.map((row, i) => (
+                <div key={i} className="hours-row">
+                  <div className="hours-bar" title={`Block ${i + 1}: ${row.start}–${row.end} h`}>
+                    <div className="hours-fill" style={{ width: `${row.pct}%` }} />
+                  </div>
+                  <span className="muted tiny hours-row-label">
+                    {row.fill.toFixed(1)} / 3 h
+                    {rows.length > 1 ? ` · block ${i + 1}` : ""}
+                  </span>
+                </div>
+              ))}
+              <div className="row gap wrap">
+                <span className="muted tiny">
+                  Total {hours.toFixed(1)} h
+                  {allowOvertime ? " (3h+ OK)" : " / 3 h"} — {label}
+                </span>
+                <div className="row gap wrap">
+                  <button className="tiny" onClick={() => bumpHours(0.5)}>
+                    +30m
+                  </button>
+                  <button className="tiny" onClick={() => bumpHours(1)}>
+                    +1h
+                  </button>
+                  <button className="tiny" onClick={resetHours}>
+                    Reset
+                  </button>
+                  <button
+                    className={`tiny ${taskIsComplete ? "active" : ""}`}
+                    onClick={() => toggleSlotRefComplete(ref)}
+                    title={
+                      taskIsComplete
+                        ? "Task is marked complete on board. Click to unmark."
+                        : "Mark task complete on board"
+                    }
+                  >
+                    <CheckSquare size={13} /> {taskIsComplete ? "Task completed" : "Mark task complete"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+          <div className="today-print-only print-line">
+            <strong>{isExtra ? "Extra deep work:" : "Deep work:"}</strong>{" "}
+            {(isExtra ? plan.extraMainRef : plan.mainRef) ? (
+              <span className={taskIsComplete ? "print-struck" : ""}>{label}</span>
+            ) : (
+              "_______________________________"
+            )}{" "}
+            ({hours.toFixed(1)} h
+            {allowOvertime && hours > 3 ? `, ${rows.length} blocks` : ""})
+          </div>
+        </section>
       );
     };
 
@@ -1869,12 +2406,57 @@ export default function App() {
       <div className="today-page">
         <div className="today-header row between wrap">
           <div>
-            <h2 className={state.theme === "rainbow" ? "spectrum-text" : ""}>Today — 3·3·3</h2>
+            <h2 className={state.theme === "rainbow" ? "spectrum-text" : ""}>
+              {extraOn ? "Today — 3·3·3 + EXTRA" : "Today — 3·3·3"}
+            </h2>
             <p className="muted tiny">
-              3 hours on your main task · 3 work · 3 life · Completed items stay crossed off until tomorrow
+              {extraOn
+                ? "Extra mode: more than 3 work/life items + a second deep-work block"
+                : "3 hours on your main task · 3 work · 3 life"}
             </p>
           </div>
-          <div className="row gap">
+          <div className="row gap wrap">
+            <button
+              className={`tiny ${extraOn ? "active" : ""}`}
+              onClick={toggleExtraMode}
+              title={
+                extraOn
+                  ? "Turn off EXTRA (keeps extra slots saved for today, but hides them)"
+                  : "Allow more than 3 work/life items + extra deep work"
+              }
+            >
+              EXTRA
+            </button>
+            <button
+              className={`tiny ${state.syncTodayCompletion ? "active" : ""}`}
+              onClick={() =>
+                setStatePreserveScroll((s) => ({
+                  ...s,
+                  syncTodayCompletion: !s.syncTodayCompletion,
+                }))
+              }
+              title={
+                state.syncTodayCompletion
+                  ? "Sync to boards: ON (checking items here also marks them complete on Work & Life boards)"
+                  : "Sync to boards: OFF (checking items here only marks them done in Today)"
+              }
+            >
+              <CheckSquare size={14} /> Sync to boards: {state.syncTodayCompletion ? "ON" : "OFF"}
+            </button>
+            <button
+              className="tiny"
+              onClick={resetCompletedToday}
+              title="Clear completed tasks, completed deep work, and finished quick to-dos"
+            >
+              <RotateCcw size={14} /> Reset completed only
+            </button>
+            <button
+              className="tiny"
+              onClick={resetAllToday}
+              title="Reset entire Today plan (clears all tasks, hours, and quick to-dos)"
+            >
+              <RotateCcw size={14} /> Reset
+            </button>
             <button className="tiny" onClick={() => void downloadTodayPdf()} title="Download a PDF">
               <Printer size={14} /> PDF
             </button>
@@ -1886,102 +2468,40 @@ export default function App() {
 
         <div ref={todayPrintRef} className="today-print-sheet">
           <div className="today-print-only">
-            <h1>Today — 3·3·3</h1>
+            <h1>{extraOn ? "Today — 3·3·3 + EXTRA" : "Today — 3·3·3"}</h1>
             <p>{printDate}</p>
           </div>
 
-          <section className="today-section today-main-block">
-            <h3>Deep work — 3 hours</h3>
-            <p className="muted tiny screen-only">One main task to protect your focus block.</p>
-            {mainDone && plan.mainRef ? (
-              <div className="today-slot done today-main-done">
-                <span className="today-slot-done-label">{mainLabel}</span>
-                <span className="muted tiny">
-                  {plan.mainHoursLogged.toFixed(1)} / 3 h logged
-                </span>
-              </div>
-            ) : (
-              <>
-                <select
-                  className="today-select screen-only"
-                  value={mainRefKey}
-                  onChange={(e) =>
-                    updateToday({
-                      mainRef: parseSlotOption(e.target.value),
-                      mainHoursLogged: 0,
-                      mainDone: false,
-                    })
-                  }
-                >
-                  <option value="">Choose main task or subtask…</option>
-                  {slotPickerOptions(workPool, workSubPool, usedRefKeys, mainRefKey)}
-                </select>
-                {plan.mainRef && (
-                  <div className="hours-tracker screen-only">
-                    <div className="hours-bar">
-                      <div className="hours-fill" style={{ width: `${hoursPct}%` }} />
-                    </div>
-                    <div className="row gap wrap">
-                      <span className="muted tiny">
-                        {plan.mainHoursLogged.toFixed(1)} / 3 h — {mainLabel}
-                      </span>
-                      <div className="row gap">
-                        <button
-                          className="tiny"
-                          onClick={() =>
-                            updateToday({ mainHoursLogged: Math.min(3, plan.mainHoursLogged + 0.5) })
-                          }
-                        >
-                          +30m
-                        </button>
-                        <button
-                          className="tiny"
-                          onClick={() =>
-                            updateToday({ mainHoursLogged: Math.min(3, plan.mainHoursLogged + 1) })
-                          }
-                        >
-                          +1h
-                        </button>
-                        <button className="tiny" onClick={() => updateToday({ mainHoursLogged: 0 })}>
-                          Reset
-                        </button>
-                        <button
-                          className="tiny"
-                          onClick={() => {
-                            fireCelebration();
-                            updateToday({ mainDone: true });
-                          }}
-                          title="Mark deep work block done for today"
-                        >
-                          Done
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                )}
-              </>
-            )}
-            <div className="today-print-only print-line">
-              <strong>Deep work:</strong>{" "}
-              {plan.mainRef ? (
-                <span className={mainDone ? "print-struck" : ""}>{mainLabel}</span>
-              ) : (
-                "_______________________________"
-              )}{" "}
-              ({plan.mainHoursLogged.toFixed(1)} / 3 h)
-            </div>
-          </section>
+          {deepWorkBlock({
+            title: extraOn ? "Deep work — 3+ hours" : "Deep work — 3 hours",
+            hint: extraOn
+              ? "Main focus block — in EXTRA mode you can log past 3 hours (new bar row each 3h)."
+              : "One main task to protect your focus block.",
+            refKey: mainRefKey,
+            label: mainLabel,
+            hours: plan.mainHoursLogged,
+            pool: workPool,
+            subPool: workSubPool,
+            used: usedRefKeys,
+            board: "work",
+            quickKey: "main",
+          })}
 
           <div className="today-grid">
             <section className="today-section">
-              <div className="today-section-head">
+              <div className="today-section-head row between">
                 <h3>
-                  <Briefcase size={16} /> 3 work
+                  <Briefcase size={16} /> {extraOn ? `${visibleWork.length} work` : "3 work"}
                 </h3>
+                {extraOn && (
+                  <button className="tiny screen-only" onClick={() => addSlot("workSlots")} title="Add another work slot">
+                    <Plus size={14} /> Add
+                  </button>
+                )}
               </div>
-              {[0, 1, 2].map((i) => slotRow("workSlots", workPool, workSubPool, i))}
+              {visibleWork.map((_, i) => slotRow("workSlots", workPool, workSubPool, i, "work"))}
               <ol className="today-print-only">
-                {plan.workSlots.map((s, i) => (
+                {visibleWork.map((s, i) => (
                   <li key={i} className={s.done ? "print-struck" : ""}>
                     {s.ref ? slotLabel(s.ref) : "_______________________________"}
                   </li>
@@ -1989,14 +2509,19 @@ export default function App() {
               </ol>
             </section>
             <section className="today-section">
-              <div className="today-section-head">
+              <div className="today-section-head row between">
                 <h3>
-                  <Home size={16} /> 3 life
+                  <Home size={16} /> {extraOn ? `${visibleLife.length} life` : "3 life"}
                 </h3>
+                {extraOn && (
+                  <button className="tiny screen-only" onClick={() => addSlot("lifeSlots")} title="Add another life slot">
+                    <Plus size={14} /> Add
+                  </button>
+                )}
               </div>
-              {[0, 1, 2].map((i) => slotRow("lifeSlots", lifePool, lifeSubPool, i))}
+              {visibleLife.map((_, i) => slotRow("lifeSlots", lifePool, lifeSubPool, i, "life"))}
               <ol className="today-print-only">
-                {plan.lifeSlots.map((s, i) => (
+                {visibleLife.map((s, i) => (
                   <li key={i} className={s.done ? "print-struck" : ""}>
                     {s.ref ? slotLabel(s.ref) : "_______________________________"}
                   </li>
@@ -2004,12 +2529,28 @@ export default function App() {
               </ol>
             </section>
           </div>
+
+          {extraOn &&
+            deepWorkBlock({
+              title: "Extra deep work — 3+ hours",
+              hint: "Optional second focus block — same main task or a new one. Past 3h adds another bar row.",
+              refKey: extraMainRefKey,
+              label: extraMainLabel,
+              hours: plan.extraMainHoursLogged,
+              pool: workPool,
+              subPool: workSubPool,
+              used: usedForExtraMain,
+              board: "work",
+              quickKey: "extraMain",
+              isExtra: true,
+              className: "today-extra-block",
+            })}
 
           <section className="today-section today-simple-section">
             <h3>Quick to-dos</h3>
             <p className="muted tiny screen-only">
-              Today-only scratch list — add, check off, no scoring. Clears tomorrow. Copy anything
-              important onto Work/Life boards to keep it.
+              Today scratch list — add, check off, no scoring. Copy anything important onto
+              Work/Life boards to keep it.
             </p>
             <div className="today-simple-add screen-only">
               <input
@@ -2106,7 +2647,10 @@ export default function App() {
 
     return (
       <div className="board">
-        <DragDropContext onDragEnd={onDragEnd}>
+        <DragDropContext
+          onDragStart={(start) => setDraggingType(start.type)}
+          onDragEnd={onDragEnd}
+        >
           <div className="columns">
             {statuses.map((s) => {
               const list = filteredByStatus(s);
@@ -2155,12 +2699,21 @@ export default function App() {
                               <div
                                 ref={prov.innerRef}
                                 {...prov.draggableProps}
-                                {...prov.dragHandleProps}
                                 className={`card ${blocked(t) ? "blocked" : ""} ${t.completed ? "done" : ""} ${
                                   snap.isDragging ? "dragging" : ""
                                 } ${!isEdit ? "compact" : ""}`}
                               >
-                                <TaskCard task={t} />
+                                <span
+                                  className="drag-handle"
+                                  title="Drag to move"
+                                  aria-label="Drag to move"
+                                  {...prov.dragHandleProps}
+                                >
+                                  <GripVertical size={14} />
+                                </span>
+                                <div className="card-body">
+                                  <TaskCard task={t} />
+                                </div>
                               </div>
                             )}
                           </Draggable>
@@ -2218,7 +2771,7 @@ export default function App() {
         <Droppable
           droppableId={`subtasks-${task.id}`}
           type="SUBTASK"
-          isDropDisabled={state.sortBy !== "manual"}
+          isDropDisabled={state.sortBy !== "manual" || draggingType === "TASK"}
         >
           {(provided) => (
             <div ref={provided.innerRef} {...provided.droppableProps} className="subtasks">
@@ -2233,9 +2786,16 @@ export default function App() {
                     <div
                       ref={prov.innerRef}
                       {...prov.draggableProps}
-                      {...prov.dragHandleProps}
                       className="subtask"
                     >
+                      <span
+                        className="drag-handle"
+                        title="Drag to reorder"
+                        aria-label="Drag to reorder"
+                        {...prov.dragHandleProps}
+                      >
+                        <GripVertical size={12} />
+                      </span>
                       <button
                         className="check"
                         onClick={() => toggleSubtaskComplete(task.id, c.id)}
@@ -2308,6 +2868,18 @@ export default function App() {
             />
           </div>
           <div className="row gap">
+            <select
+              className="status-jump"
+              value={task.status}
+              onChange={(e) => moveTaskToStatus(task.id, e.target.value as Status)}
+              title="Move to column"
+            >
+              {statuses.map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+            </select>
             {task.archived ? (
               <button className="tiny" onClick={() => unarchiveTask(task.id)} title="Restore from archive">
                 Restore
@@ -2837,14 +3409,14 @@ export default function App() {
                   ? "Today"
                   : state.section === "life"
                     ? "Life"
-                    : "Now / Next / Later"}
+                    : "Prioritizer"}
               </h1>
               <div className="muted tiny">
                 {state.section === "today"
                   ? "3·3·3 productive day planner"
                   : state.section === "life"
                     ? "Personal & home tasks"
-                    : "Team prioritizer (ICE × Urgency)"}
+                    : "Now / Next / Later · ICE × Urgency"}
               </div>
             </div>
           </div>
@@ -3243,19 +3815,27 @@ export default function App() {
                 <ul className="help-list">
                   <li>
                     Pick a <strong>main</strong> task or subtask for 3 hours of deep work; log time with
-                    +30m / +1h.
+                    +30m / +1h. Or type a new task under the dropdown and press Enter.
                   </li>
                   <li>
                     Choose <strong>3 work</strong> and <strong>3 life</strong> items from your boards
                     (tasks or subtasks in one list).
                   </li>
                   <li>
-                    <strong>Quick to-dos</strong> at the bottom are scratch items for today only — no
-                    scores, reset tomorrow.
+                    Turn on <strong>EXTRA</strong> for more than 3 work/life slots plus a second deep-work
+                    block (same main task or a new one, 3+ hours).
                   </li>
                   <li>
-                    <strong>Download PDF</strong> exports your day plan. Done items stay crossed off
-                    until the next calendar day.
+                    <strong>Sync to boards</strong> toggle controls whether completing tasks in Today
+                    also marks them complete on your Work and Life boards.
+                  </li>
+                  <li>
+                    <strong>Quick to-dos</strong> at the bottom are scratch items for today — no
+                    scores. Clear them anytime with <strong>Reset</strong> or <strong>Reset completed only</strong>.
+                  </li>
+                  <li>
+                    <strong>PDF / TXT</strong> export your day plan. Work/Life <strong>JSON / CSV / PDF / TXT</strong>
+                    filenames include a time stamp so multiple exports the same day don’t overwrite.
                   </li>
                 </ul>
 
@@ -3734,14 +4314,42 @@ a { color: var(--accent); text-decoration: none; }
 .col-header { display:flex; justify-content: space-between; align-items: center; padding: 8px; border-bottom: 1px dashed var(--border); }
 .col-title { display:flex; align-items:center; gap:8px; }
 .col-meta { display:flex; align-items:center; gap:6px; }
-.tasklist { padding: 8px; display:flex; flex-direction: column; gap: 8px; }
+.tasklist { padding: 8px; display:flex; flex-direction: column; gap: 8px; min-height: 80px; }
 
 /* Quick add */
 .quickadd { display:flex; gap: 6px; padding: 8px; border-bottom: 1px dashed var(--border); }
 .quickadd input { flex: 1; padding: 6px 8px; border:1px solid var(--border); border-radius: 8px; background: transparent; }
 
 /* Cards */
-.card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 8px; display:flex; flex-direction: column; gap: 6px; }
+.card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 8px; display:flex; flex-direction: row; align-items: flex-start; gap: 4px; }
+.card-body { flex: 1; min-width: 0; display:flex; flex-direction: column; gap: 6px; }
+.drag-handle {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  align-self: stretch;
+  width: 22px;
+  min-height: 36px;
+  margin-top: 0;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: grab;
+}
+.status-jump {
+  font-size: 11px;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  text-transform: uppercase;
+}
+.drag-handle:hover { color: var(--text); background: color-mix(in srgb, var(--bg-elev) 70%, transparent); }
+.drag-handle:active { cursor: grabbing; }
 .board .card { font-size: 12px; }
 .board .card .title { font-size: 13px; }
 .pill.metric { font-size: 11px; }
@@ -3887,13 +4495,36 @@ svg .muted { fill: var(--muted); }
 .today-select, .today-slot select { width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--card); margin-top: 6px; }
 .today-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 @media (max-width: 720px) { .today-grid { grid-template-columns: 1fr; } }
-.today-slot { display: grid; grid-template-columns: 24px 1fr auto; gap: 8px; align-items: center; margin-top: 8px; }
+.today-slot-block { margin-top: 8px; }
+.today-slot { display: grid; grid-template-columns: 24px 1fr auto auto; gap: 8px; align-items: center; }
+.today-slot.done { margin-top: 8px; }
+.today-quick-add {
+  display: flex;
+  gap: 6px;
+  margin-top: 4px;
+  margin-left: 32px;
+}
+.today-quick-add input {
+  flex: 1;
+  padding: 6px 8px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  background: transparent;
+  font-size: 12px;
+}
+.today-extra-block {
+  margin-top: 12px;
+  border-style: dashed;
+}
 .slot-num { font-weight: 700; color: var(--muted); text-align: center; }
 .hours-tracker { margin-top: 10px; display: flex; flex-direction: column; gap: 8px; }
+.hours-row { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; }
+.hours-row-label { white-space: nowrap; }
 .hours-bar { height: 8px; background: var(--border); border-radius: 999px; overflow: hidden; }
 .hours-fill { height: 100%; background: var(--accent); border-radius: 999px; transition: width 0.2s ease; }
 .today-hint kbd { font: inherit; font-size: 10px; padding: 1px 5px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-elev); }
 .today-slot.done .today-slot-done-label { text-decoration: line-through; opacity: 0.75; color: var(--muted); }
+.today-main-done { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .today-slot-done-label { flex: 1; min-width: 0; padding: 8px 0; }
 .today-section-head { margin-bottom: 4px; align-items: center; gap: 12px; }
 .today-mode-row { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }

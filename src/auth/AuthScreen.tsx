@@ -40,7 +40,7 @@ export function AuthScreen({ onClose }: { onClose: () => void }) {
           <X size={18} />
         </button>
         <img src="/parhelia-logo.png" alt="Parhelia Bio" className="auth-brand" />
-        <h1>Now / Next / Later</h1>
+        <h1>Prioritizer</h1>
         <p className="muted tiny">Sign in to sync boards across devices (optional).</p>
 
         <form onSubmit={submit} className="auth-form">
