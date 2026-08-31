@@ -612,32 +612,54 @@ const seedData = (): Task[] => {
     updatedAt: t0,
   });
 
-  const orbiter: Task = {
-    id: "T-orbiter-v2",
-    title: "Orbiter prototype v2 (panel mixer)",
-    details: "Integrate CLLD insert + firmware; validate 32×2µL mixing.",
+  const task1: Task = {
+    id: "T-lorem-magna",
+    title: "Lorem ipsum dolor sit amet",
+    details: "Consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore.",
     status: "now",
     impact: 9,
     confidence: 8,
     ease: 6,
     urgency: 7,
     completed: false,
-    order: 1,
+    order: 0,
     createdAt: t0,
     updatedAt: t0,
-    owner: "Nels",
-    tags: ["R&D", "hardware", "example"],
+    owner: "Alex",
+    tags: ["project", "design", "example"],
     due: t0 + 1000 * 60 * 60 * 24 * 5,
     estimateH: 10,
     deps: [],
-    children: [mkSub("Wire harness v2", 0), mkSub("Firmware build", 1)],
-    deliverables: [mkDel("Validation report", "#"), mkDel("BOM", "#")],
+    children: [mkSub("Duis aute irure dolor", 0), mkSub("Excepteur sint occaecat", 1)],
+    deliverables: [mkDel("Specification document", "#"), mkDel("Asset bundle", "#")],
   };
 
-  const visium: Task = {
-    id: "T-visium-install",
-    title: "Visium install (NIH)",
-    details: "2-day onsite: install + training + test slides.",
+  const task2: Task = {
+    id: "T-tempus-varius",
+    title: "Vestibulum ante ipsum primis",
+    details: "Faucibus orci luctus et ultrices posuere cubilia curae integer.",
+    status: "now",
+    impact: 8,
+    confidence: 9,
+    ease: 8,
+    urgency: 6,
+    completed: false,
+    order: 1,
+    createdAt: t0,
+    updatedAt: t0,
+    owner: "Jordan",
+    tags: ["operations", "docs", "example"],
+    due: null,
+    estimateH: 12,
+    deps: [],
+    children: [mkSub("Curabitur sodales ligula", 0)],
+    deliverables: [mkDel("Guidelines v1", "#")],
+  };
+
+  const task3: Task = {
+    id: "T-curabitur-vel",
+    title: "Curabitur pretium tincidunt lacus",
+    details: "Nulla facilisi etiam dignissim diam quis enim lobortis scelerisque fermentum.",
     status: "next",
     impact: 10,
     confidence: 7,
@@ -647,41 +669,41 @@ const seedData = (): Task[] => {
     order: 0,
     createdAt: t0,
     updatedAt: t0,
-    owner: "Nels",
-    tags: ["customer", "training", "example"],
+    owner: "Alex",
+    tags: ["delivery", "review", "example"],
     due: t0 + 1000 * 60 * 60 * 24 * 14,
     estimateH: 16,
-    deps: ["T-orbiter-v2"],
-    children: [mkSub("Ship consumables", 0), mkSub("Prep deck", 1)],
-    deliverables: [mkDel("Install checklist", "#")],
+    deps: ["T-lorem-magna"],
+    children: [mkSub("Aenean euismod elementum", 0), mkSub("Vivamus at augue eget", 1)],
+    deliverables: [mkDel("Checklist", "#")],
   };
 
-  const prod: Task = {
-    id: "T-prod-sop",
-    title: "Production SOPs v1",
-    details: "Priming, decontam, service guide.",
-    status: "now",
-    impact: 8,
-    confidence: 9,
-    ease: 8,
-    urgency: 6,
+  const task4: Task = {
+    id: "T-phasellus-ornare",
+    title: "Phasellus vestibulum lorem sed risus",
+    details: "Ullamcorper morbi tincidunt ornare massa eget egestas purus viverra.",
+    status: "next",
+    impact: 7,
+    confidence: 6,
+    ease: 7,
+    urgency: 7,
     completed: false,
-    order: 0,
+    order: 1,
     createdAt: t0,
     updatedAt: t0,
-    owner: "Kevin",
-    tags: ["production", "docs", "example"],
+    owner: "Morgan",
+    tags: ["analysis", "quality", "example"],
     due: null,
-    estimateH: 12,
+    estimateH: 8,
     deps: [],
-    children: [mkSub("Priming SOP draft", 0)],
-    deliverables: [mkDel("SOP v1 PDF", "#")],
+    children: [mkSub("Pellentesque habitant morbi", 0), mkSub("Tristique senectus et netus", 1)],
+    deliverables: [],
   };
 
-  const training: Task = {
-    id: "T-onboarding-webinar",
-    title: "Customer onboarding webinar 02",
-    details: "30-min overview + live demo.",
+  const task5: Task = {
+    id: "T-vulputate-aliquet",
+    title: "Vulputate dignissim suspendisse in est",
+    details: "Aliquam id diam maecenas ultricies mi eget mauris pharetra et.",
     status: "later",
     impact: 6,
     confidence: 8,
@@ -691,38 +713,16 @@ const seedData = (): Task[] => {
     order: 0,
     createdAt: t0,
     updatedAt: t0,
-    owner: "Michael",
-    tags: ["marketing", "training", "example"],
+    owner: "Taylor",
+    tags: ["exploration", "example"],
     due: null,
     estimateH: 6,
-    deps: ["T-prod-sop"],
+    deps: ["T-tempus-varius"],
     children: [],
-    deliverables: [mkDel("Slide deck", "#")],
+    deliverables: [mkDel("Presentation deck", "#")],
   };
 
-  const pss: Task = {
-    id: "T-pss-buffer-test",
-    title: "PSS buffer A/B (G-Buffer vs ER1/ER2)",
-    details: "Keep protocol constant; compare genomic vs protein.",
-    status: "next",
-    impact: 7,
-    confidence: 6,
-    ease: 7,
-    urgency: 7,
-    completed: false,
-    order: 2,
-    createdAt: t0,
-    updatedAt: t0,
-    owner: "Nikolay",
-    tags: ["chemistry", "assay", "example"],
-    due: null,
-    estimateH: 8,
-    deps: [],
-    children: [mkSub("Skylab kit prep", 0), mkSub("Run replicates", 1)],
-    deliverables: [],
-  };
-
-  return [prod, orbiter, visium, training, pss];
+  return [task1, task2, task3, task4, task5];
 };
 
 const lifeSeedData = (): Task[] => {
@@ -750,10 +750,10 @@ const lifeSeedData = (): Task[] => {
     deliverables: [],
   });
   return [
-    mk("Clean house", "now", 0, "Kitchen, bathroom, living room."),
-    mk("Submit housing inquiry", "next", 0, "Follow up on application status."),
-    mk("Schedule dentist", "later", 0),
-    mk("Grocery run", "later", 1),
+    mk("Tempus imperdiet nulla malesuada", "now", 0, "Pellentesque habitant morbi tristique."),
+    mk("Fringilla phasellus faucibus scelerisque", "next", 0, "Eleifend donec pretium vulputate."),
+    mk("Habitasse platea dictumst vestibulum", "later", 0),
+    mk("Porttitor rhoncus dolor purus non", "later", 1),
   ];
 };
 
